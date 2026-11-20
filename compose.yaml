@@ -1,0 +1,48 @@
+services:
+  portal:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    environment:
+      PORTAL_TRUST_PROXY: "1"
+    volumes:
+      - portal_data:/data
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8765/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      PORTAL_HOST: "${PORTAL_HOST:-${PORTAL_DOMAIN:-}}"
+      PORTAL_HTTPS_PORT: "${PORTAL_HTTPS_PORT:-443}"
+    depends_on:
+      portal:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "${PORTAL_HTTPS_PORT:-443}:${PORTAL_HTTPS_PORT:-443}"
+    volumes:
+      - ./deploy/${PORTAL_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+      - backend
+    restart: unless-stopped
+
+networks:
+  edge:
+  backend:
+    internal: true
+
+volumes:
+  portal_data:
+  caddy_data:
+  caddy_config:

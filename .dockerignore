@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!server/
+!server/**
+!protocol/
+!protocol/**
+!desktop/
+!desktop/Cargo.toml
+!interface/
+!interface/Cargo.toml
+!deploy/
+!deploy/Dockerfile

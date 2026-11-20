@@ -1,0 +1,7 @@
+{
+  "name": "portal-pet",
+  "version": "1.0.5",
+  "description": "Portal Pet 原生鸿蒙客户端",
+  "modelVersion": "5.0.0",
+  "dependencies": {}
+}

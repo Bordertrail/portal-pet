@@ -1,0 +1,9 @@
+{
+	https_port {$PORTAL_HTTPS_PORT}
+}
+
+{$PORTAL_HOST} {
+	reverse_proxy portal:8765 {
+		header_up X-Portal-Client-IP {remote_host}
+	}
+}

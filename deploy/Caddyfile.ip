@@ -1,0 +1,18 @@
+{
+	# IP clients can omit SNI. Select the public IP certificate behind Docker NAT.
+	default_sni {$PORTAL_HOST}
+}
+
+https://{$PORTAL_HOST}:{$PORTAL_HTTPS_PORT} {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+
+	reverse_proxy portal:8765 {
+		header_up X-Portal-Client-IP {remote_host}
+	}
+}

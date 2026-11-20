@@ -1,0 +1,13 @@
+{
+  "color": [
+    { "name": "background", "value": "#F8F6FC" },
+    { "name": "surface", "value": "#FFFFFF" },
+    { "name": "wash", "value": "#EFEBFC" },
+    { "name": "line", "value": "#E9E3F4" },
+    { "name": "ink", "value": "#241B37" },
+    { "name": "muted", "value": "#625970" },
+    { "name": "accent", "value": "#6042BD" },
+    { "name": "positive", "value": "#27794F" },
+    { "name": "negative", "value": "#AB294D" }
+  ]
+}
