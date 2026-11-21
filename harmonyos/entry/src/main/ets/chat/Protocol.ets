@@ -1,5 +1,6 @@
 export const DEFAULT_SERVER_ADDRESS: string = 'https://chat.example.com';
 export const SECURITY_CODE_LENGTH: number = 6;
+export const MAX_IMAGE_BYTES: number = 8 * 1024 * 1024;
 
 export interface Member {
   id: number;
@@ -39,12 +40,19 @@ export interface IssuedAccount {
   code: string;
 }
 
+export interface ChatImage {
+  width: number;
+  height: number;
+  bytes: number;
+}
+
 export interface ChatMessage {
   id: number;
   sender: Member;
   recipient_id: number;
   body: string;
   sent_at: number;
+  image?: ChatImage;
 }
 
 export interface Activation {

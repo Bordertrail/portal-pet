@@ -1,4 +1,7 @@
+import ImageIO
+import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct PortalPetApp: App {
@@ -538,6 +541,12 @@ private struct ConversationView: View {
     @State private var sending = false
     @State private var ending = false
     @State private var attempt: Attempt?
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var preparedPhoto: PhotoAttempt?
+    @State private var preparingPhoto = false
+    @StateObject private var shelf = StickerShelf()
+    @State private var choosingEmoji = false
+    @State private var droppingPhoto = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dismiss) private var dismiss
 
@@ -546,9 +555,16 @@ private struct ConversationView: View {
         let id: UUID
     }
 
+    private struct PhotoAttempt {
+        let data: Data
+        let id = UUID()
+    }
+
     private var messages: [ChatMessage] { store.messages[peer.id] ?? [] }
     private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var canSend: Bool { !sending && !ending && !trimmed.isEmpty && trimmed.unicodeScalars.count <= 2000 }
+    private var canSend: Bool {
+        !sending && !ending && !preparingPhoto && (preparedPhoto != nil || (!trimmed.isEmpty && trimmed.unicodeScalars.count <= 2000))
+    }
 
     var body: some View {
         ScrollViewReader { scroll in
@@ -575,6 +591,15 @@ private struct ConversationView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+        .overlay {
+            if droppingPhoto && !sending && !ending && !preparingPhoto {
+                Label("松开添加图片", systemImage: "photo.badge.plus")
+                    .font(.headline).padding(20)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [.image], isTargeted: $droppingPhoto, perform: acceptPhoto)
         .background(PortalTheme.background.ignoresSafeArea())
         .navigationTitle(peer.nickname)
         .navigationBarTitleDisplayMode(.inline)
@@ -595,22 +620,63 @@ private struct ConversationView: View {
         .onAppear { store.enter(peer.id) }
         .onDisappear { store.leave(peer.id) }
         .task(id: peer.id) { await store.loadHistory(peer.id) }
+        .task(id: store.session?.member.id) { shelf.load(store.session) }
+        .task(id: selectedPhoto) {
+            if let selectedPhoto { await preparePhoto(selectedPhoto) }
+        }
+        .sheet(isPresented: $choosingEmoji) {
+            StickerPicker(shelf: shelf) { glyph in
+                if (draft + glyph).unicodeScalars.count <= 2000 {
+                    draft += glyph
+                } else {
+                    store.notice = "消息最多 2000 个字符。"
+                }
+            } selectPicture: { image in
+                preparedPhoto = PhotoAttempt(data: image)
+            } importPicture: { item in
+                try await Self.readPhoto(item)
+            }
+            .presentationDetents([.medium, .large])
+        }
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 9) {
-            VStack(alignment: .leading, spacing: 6) {
-                TextField("输入消息", text: $draft, axis: .vertical)
-                    .lineLimit(1...5)
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 11)
-                    .background(PortalTheme.background, in: RoundedRectangle(cornerRadius: 16))
-                    .foregroundStyle(PortalTheme.text)
-                    .accessibilityIdentifier("portal.message")
-                if trimmed.unicodeScalars.count > 2000 {
-                    Text("消息最多 2000 个字符")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+        HStack(alignment: .bottom, spacing: 6) {
+            Button {
+                choosingEmoji = true
+            } label: {
+                Image(systemName: "face.smiling").frame(width: 34, height: 46)
+            }
+            .disabled(sending || ending || preparingPhoto)
+            .accessibilityLabel("表情与收藏")
+            PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                Image(systemName: "photo").frame(width: 34, height: 46)
+            }
+            .disabled(sending || ending || preparingPhoto)
+            .accessibilityLabel("添加图片")
+            if let photo = preparedPhoto, let thumbnail = UIImage(data: photo.data) {
+                HStack {
+                    Image(uiImage: thumbnail).resizable().scaledToFit().frame(width: 46, height: 46)
+                    Text("已选图片").font(.subheadline)
+                    Spacer()
+                    Button("移除") { preparedPhoto = nil }.disabled(sending)
+                }
+            } else if preparingPhoto {
+                ProgressView("正在读取图片…").frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    TextField("输入消息", text: $draft, axis: .vertical)
+                        .lineLimit(1...5)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 11)
+                        .background(PortalTheme.background, in: RoundedRectangle(cornerRadius: 16))
+                        .foregroundStyle(PortalTheme.text)
+                        .accessibilityIdentifier("portal.message")
+                    if trimmed.unicodeScalars.count > 2000 {
+                        Text("消息最多 2000 个字符")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
             }
             Button(action: send) {
@@ -644,19 +710,30 @@ private struct ConversationView: View {
             if mine { Spacer(minLength: 36) }
             if !mine { PetAvatar(member: peer.id, avatar: peer.avatar, size: 34) }
             VStack(alignment: mine ? .trailing : .leading, spacing: 5) {
-                Text(message.body)
-                    .font(.body)
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 9)
-                    .foregroundStyle(mine ? Color.white : PortalTheme.text)
-                    .background(
-                        mine ? PortalTheme.violet : PortalTheme.surface,
-                        in: UnevenRoundedRectangle(
-                            topLeadingRadius: mine ? 17 : 6, bottomLeadingRadius: 17,
-                            bottomTrailingRadius: 17, topTrailingRadius: mine ? 6 : 17
+                if let image = message.image {
+                    ConversationPhoto(store: store, message: message, info: image) { data in
+                        do {
+                            try shelf.save(data)
+                            store.notice = "已收藏为表情。"
+                        } catch {
+                            store.notice = error.localizedDescription
+                        }
+                    }
+                } else {
+                    Text(message.body)
+                        .font(.body)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 9)
+                        .foregroundStyle(mine ? Color.white : PortalTheme.text)
+                        .background(
+                            mine ? PortalTheme.violet : PortalTheme.surface,
+                            in: UnevenRoundedRectangle(
+                                topLeadingRadius: mine ? 17 : 6, bottomLeadingRadius: 17,
+                                bottomTrailingRadius: 17, topTrailingRadius: mine ? 6 : 17
+                            )
                         )
-                    )
-                    .textSelection(.enabled)
+                        .textSelection(.enabled)
+                }
                 Text(message.date, style: .time)
                     .font(.caption2)
                     .foregroundStyle(PortalTheme.muted)
@@ -667,6 +744,14 @@ private struct ConversationView: View {
 
     private func send() {
         guard canSend else { return }
+        if let photo = preparedPhoto {
+            sending = true
+            Task {
+                if await store.sendImage(peer.id, data: photo.data, id: photo.id) { preparedPhoto = nil }
+                sending = false
+            }
+            return
+        }
         let body = trimmed
         let pending = attempt.flatMap { $0.body == body ? $0 : nil } ?? Attempt(body: body, id: UUID())
         attempt = pending
@@ -677,6 +762,128 @@ private struct ConversationView: View {
                 attempt = nil
             }
             sending = false
+        }
+    }
+
+    private func preparePhoto(_ item: PhotosPickerItem) async {
+        preparingPhoto = true
+        defer {
+            preparingPhoto = false
+            selectedPhoto = nil
+        }
+        do {
+            let prepared = try await Self.readPhoto(item)
+            preparedPhoto = PhotoAttempt(data: prepared)
+        } catch {
+            if !Task.isCancelled { store.notice = "无法读取所选图片，请换一张试试。" }
+        }
+    }
+
+    private static func readPhoto(_ item: PhotosPickerItem) async throws -> Data {
+        guard let raw = try await item.loadTransferable(type: Data.self) else { throw PortalError.invalidResponse }
+        let image = await Task.detached(priority: .userInitiated) { Self.photoData(raw) }.value
+        try Task.checkCancellation()
+        guard let image else { throw PortalError.invalidResponse }
+        return image
+    }
+
+    private func acceptPhoto(_ providers: [NSItemProvider]) -> Bool {
+        guard !sending, !ending, !preparingPhoto,
+              let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }),
+              let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) else {
+            return false
+        }
+        preparingPhoto = true
+        let session = store.session
+        provider.loadDataRepresentation(forTypeIdentifier: type) { raw, _ in
+            Task { @MainActor in
+                defer { preparingPhoto = false }
+                let prepared = await Task.detached(priority: .userInitiated) { raw.flatMap(Self.photoData) }.value
+                guard store.session == session else { return }
+                if let prepared { preparedPhoto = PhotoAttempt(data: prepared) }
+                else { store.notice = "无法读取拖入的图片。" }
+            }
+        }
+        return true
+    }
+
+    nonisolated private static func photoData(_ raw: Data) -> Data? {
+        guard let source = CGImageSourceCreateWithData(raw as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 2400
+              ] as CFDictionary) else { return nil }
+        let photo = UIImage(cgImage: image)
+        if image.alphaInfo == .premultipliedFirst || image.alphaInfo == .premultipliedLast,
+           let png = photo.pngData(), png.count <= PortalAPI.maxImageBytes { return png }
+        guard let jpeg = photo.jpegData(compressionQuality: 0.86), jpeg.count <= PortalAPI.maxImageBytes else { return nil }
+        return jpeg
+    }
+}
+
+private struct ConversationPhoto: View {
+    let store: ChatStore
+    let message: ChatMessage
+    let info: ChatImage
+    let save: (Data) -> Void
+    @State private var sourceData: Data?
+    @State private var photo: UIImage?
+    @State private var failed = false
+    @State private var attempt = 0
+    @State private var enlarged = false
+
+    var body: some View {
+        Group {
+            if let photo {
+                Button { enlarged = true } label: {
+                    Image(uiImage: photo).resizable().scaledToFit()
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("查看聊天图片")
+                .accessibilityAction(named: "收藏为表情") { if let sourceData { save(sourceData) } }
+                .contextMenu {
+                    Button("收藏为表情", systemImage: "star") { if let sourceData { save(sourceData) } }
+                }
+                .sheet(isPresented: $enlarged) {
+                    NavigationStack {
+                        Image(uiImage: sourceData.flatMap { UIImage(data: $0) } ?? photo).resizable().scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .toolbar { Button("关闭") { enlarged = false } }
+                    }
+                }
+            } else if failed {
+                Button("图片未加载，点此重试") {
+                    failed = false
+                    attempt += 1
+                }
+                .font(.caption)
+            } else {
+                ProgressView().accessibilityLabel("正在加载图片")
+            }
+        }
+        .frame(width: 200, height: min(200, max(72, 200 * CGFloat(info.height) / CGFloat(max(info.width, 1)))))
+        .background(PortalTheme.surface, in: RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .task(id: attempt) {
+            guard photo == nil else { return }
+            do {
+                let data = try await store.imageData(message)
+                let thumbnail = await Task.detached(priority: .userInitiated) {
+                    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil as CGImage? }
+                    return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 640
+                    ] as CFDictionary)
+                }.value
+                guard !Task.isCancelled else { return }
+                photo = thumbnail.map { UIImage(cgImage: $0) }
+                sourceData = data
+                failed = photo == nil
+            } catch {
+                if !Task.isCancelled { failed = true }
+            }
         }
     }
 }

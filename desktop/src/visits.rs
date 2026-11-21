@@ -272,6 +272,34 @@ fn build_guest(app: &AppHandle, guest: &Guest) -> DesktopResult {
     Ok(())
 }
 
+fn update_guest_unread(app: &AppHandle, peer: i64) -> DesktopResult {
+    let (label, count) = {
+        let desktop = app.state::<Desktop>();
+        let state = desktop.state.lock().unwrap();
+        let Some(guest) = state
+            .visits
+            .guests
+            .get(&peer)
+            .filter(|guest| guest.ready && guest.appeared)
+        else {
+            return Ok(());
+        };
+        let showing_preview = state
+            .visits
+            .bubble
+            .as_ref()
+            .is_some_and(|arrival| arrival.peer.id == peer);
+        let count = if showing_preview {
+            0
+        } else {
+            state.unread.get(&peer).copied().unwrap_or_default()
+        };
+        (guest.label.clone(), count)
+    };
+    app.emit_to(label, "portal-visitor-unread", count)
+        .map_err(|error| error.to_string())
+}
+
 fn reveal_guest(app: &AppHandle, peer: i64) -> DesktopResult {
     let account = scope(app);
     let guest = {
@@ -291,6 +319,7 @@ fn reveal_guest(app: &AppHandle, peer: i64) -> DesktopResult {
     if let Some(guest) = guest {
         build_guest(app, &guest)?;
         if guest.ready {
+            update_guest_unread(app, peer)?;
             show(app, &guest.label)?;
         }
     }
@@ -342,21 +371,17 @@ pub(super) fn sync_guest_profiles(app: &AppHandle, people: &[Member]) -> Desktop
 }
 
 fn dismiss_bubble(app: &AppHandle, peer: Option<i64>) -> DesktopResult {
-    let dismiss = {
+    let dismissed = {
         let desktop = app.state::<Desktop>();
         let mut state = desktop.state.lock().unwrap();
-        let found = state
+        state
             .visits
             .bubble
-            .as_ref()
-            .is_some_and(|arrival| peer.is_none_or(|peer| peer == arrival.peer.id));
-        if found {
-            state.visits.bubble = None;
-        }
-        found
+            .take_if(|arrival| peer.is_none_or(|peer| peer == arrival.peer.id))
     };
-    if dismiss {
+    if let Some(arrival) = dismissed {
         hide(app, BUBBLE)?;
+        update_guest_unread(app, arrival.peer.id)?;
     }
     Ok(())
 }
@@ -426,10 +451,15 @@ fn show_bubble(app: &AppHandle, arrival: Arrival, spot: Spot) -> DesktopResult {
     spot.offset(BUBBLE_OFFSET_X, -1.0)
         .put(&lookup(app, BUBBLE)?)?;
     let generation = arrival.generation;
-    app.emit_to(BUBBLE, "portal-bubble", &arrival)
-        .map_err(|e| e.to_string())?;
-    app.state::<Desktop>().state.lock().unwrap().visits.bubble = Some(arrival);
-    show(app, BUBBLE)?;
+    let peer = arrival.peer.id;
+    let previous = app
+        .state::<Desktop>()
+        .state
+        .lock()
+        .unwrap()
+        .visits
+        .bubble
+        .replace(arrival.clone());
     later(app, app.state::<Desktop>().hold, move |app| {
         let current = app
             .state::<Desktop>()
@@ -445,6 +475,13 @@ fn show_bubble(app: &AppHandle, arrival: Arrival, spot: Spot) -> DesktopResult {
         }
         Ok(())
     });
+    update_guest_unread(app, peer)?;
+    app.emit_to(BUBBLE, "portal-bubble", &arrival)
+        .map_err(|e| e.to_string())?;
+    show(app, BUBBLE)?;
+    if let Some(previous) = previous.filter(|previous| previous.peer.id != peer) {
+        update_guest_unread(app, previous.peer.id)?;
+    }
     Ok(())
 }
 
@@ -600,10 +637,10 @@ fn finish_motion(app: &AppHandle, generation: u64) -> DesktopResult {
         eprintln!("{error}");
     }
     if let Some((peer, arrival, spot)) = incoming {
-        reveal_guest(app, peer)?;
         if let Some(arrival) = arrival {
             show_bubble(app, arrival, spot)?;
         }
+        reveal_guest(app, peer)?;
     }
     hide(app, PORTAL)?;
     app.emit_to(PORTAL, "portal-motion", None::<VisitAnimation>)
@@ -645,7 +682,8 @@ pub(super) fn receive(app: &AppHandle, message: Message) -> DesktopResult {
         }
         let reading = chat_focused && state.selected == Some(peer);
         if !reading {
-            state.unread.insert(peer);
+            let count = state.unread.entry(peer).or_default();
+            *count = count.saturating_add(1);
         }
         let hidden = state.hidden || state.visits.guest_hidden(account.as_deref(), peer);
         let generation = state.visits.next_id();
@@ -654,9 +692,14 @@ pub(super) fn receive(app: &AppHandle, message: Message) -> DesktopResult {
             peer: message.sender.clone(),
             body: message.body,
         });
+        let previewing = state
+            .visits
+            .bubble
+            .as_ref()
+            .is_some_and(|arrival| arrival.peer.id == peer);
         if let Some(guest) = state.visits.guests.get_mut(&peer) {
             guest.last_message_id = message.id;
-            if guest.appeared {
+            if guest.appeared || previewing {
                 notice.map(|arrival| (arrival, guest.spot))
             } else {
                 guest.pending_bubble = notice;
@@ -701,6 +744,8 @@ pub(super) fn receive(app: &AppHandle, message: Message) -> DesktopResult {
     unread_indicator(app, unread)?;
     if let Some((arrival, spot)) = bubble {
         show_bubble(app, arrival, spot)?;
+    } else {
+        update_guest_unread(app, peer)?;
     }
     begin_next(app)
 }
@@ -810,17 +855,16 @@ pub(super) fn open_guest(app: &AppHandle, label: &str) -> DesktopResult {
     Ok(())
 }
 
-pub(super) fn open_bubble(app: &AppHandle, generation: u64) -> DesktopResult {
+pub(super) fn open_bubble(app: &AppHandle, peer: i64) -> DesktopResult {
     let member = app
         .state::<Desktop>()
         .state
         .lock()
         .unwrap()
         .visits
-        .bubble
-        .as_ref()
-        .filter(|arrival| arrival.generation == generation)
-        .map(|arrival| arrival.peer.clone());
+        .guests
+        .get(&peer)
+        .map(|guest| guest.member.clone());
     if let Some(member) = member {
         open_peer(app, member)?;
     }
@@ -846,6 +890,7 @@ pub(super) fn read_peer(app: &AppHandle, peer: i64) -> DesktopResult {
     {
         guest.pending_bubble = None;
     }
+    update_guest_unread(app, peer)?;
     dismiss_bubble(app, Some(peer))
 }
 

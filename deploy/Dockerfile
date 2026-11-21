@@ -1,7 +1,7 @@
 FROM rust:1.92-bookworm AS build
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssl unzip \
+    && apt-get install -y --no-install-recommends libssl-dev openssl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Use a patched SQLite for WAL and ship its shell for online backups.
@@ -40,7 +40,7 @@ RUN cargo build --release --locked -p portal-server \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 -o 10001 -g 10001 /data
 

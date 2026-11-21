@@ -1,4 +1,5 @@
 mod api;
+mod oss;
 mod store;
 
 use std::{net::SocketAddr, path::PathBuf};
@@ -15,6 +16,7 @@ async fn main() -> Result<()> {
     match (command.as_str(), args.next(), args.next()) {
         ("serve", address, None) => {
             let address: SocketAddr = address.as_deref().unwrap_or("127.0.0.1:8765").parse()?;
+            let storage = oss::Storage::from_env()?;
             let pool = store::open(&path).await?;
             let listener = tokio::net::TcpListener::bind(address).await?;
             eprintln!("Portal server listening on {}", listener.local_addr()?);
@@ -23,7 +25,8 @@ async fn main() -> Result<()> {
             let trust_proxy = std::env::var("PORTAL_TRUST_PROXY").as_deref() == Ok("1");
             axum::serve(
                 listener,
-                api::router(pool, trust_proxy).into_make_service_with_connect_info::<SocketAddr>(),
+                api::router(pool, trust_proxy, storage)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await?;
         }

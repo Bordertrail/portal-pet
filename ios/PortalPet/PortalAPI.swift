@@ -59,12 +59,19 @@ struct ConversationEnd: Decodable, Equatable {
     func other(for member: Int64) -> Int64 { endedBy.id == member ? peerId : endedBy.id }
 }
 
+struct ChatImage: Decodable, Equatable {
+    let width: Int
+    let height: Int
+    let bytes: Int
+}
+
 struct ChatMessage: Decodable, Identifiable, Equatable {
     let id: Int64
     let sender: Member
     let recipientId: Int64
     let body: String
     let sentAt: Int64
+    let image: ChatImage?
 
     var date: Date { Date(timeIntervalSince1970: TimeInterval(sentAt)) }
 
@@ -127,6 +134,7 @@ private final class RejectRedirects: NSObject, URLSessionTaskDelegate {
 struct PortalAPI {
     static let defaultServerAddress = "https://chat.example.com"
     static let securityCodeLength = 6
+    static let maxImageBytes = 8 * 1024 * 1024
 
     private let network: URLSession
 
@@ -221,6 +229,16 @@ struct PortalAPI {
         ))
     }
 
+    func sendImage(_ peer: Int64, data: Data, id: UUID, _ session: ChatSession) async throws -> ChatMessage {
+        try decode(await request("message-images/\(peer)/\(id.uuidString)", at: session.server,
+                                 method: "POST", token: session.token, body: data,
+                                 contentType: "application/octet-stream", timeout: 60))
+    }
+
+    func image(_ id: Int64, _ session: ChatSession) async throws -> Data {
+        try await request("message-images/\(id)", at: session.server, token: session.token, timeout: 45)
+    }
+
     func logout(_ session: ChatSession) async throws {
         _ = try await request("session/logout", at: session.server, method: "POST", token: session.token)
     }
@@ -254,13 +272,15 @@ struct PortalAPI {
     }
 
     private func request(
-        _ path: String, at server: URL, method: String = "GET", token: String? = nil, body: Data? = nil
+        _ path: String, at server: URL, method: String = "GET", token: String? = nil, body: Data? = nil,
+        contentType: String = "application/json", timeout: TimeInterval = 12
     ) async throws -> Data {
         var request = URLRequest(url: endpoint(path, at: server))
         request.httpMethod = method
+        request.timeoutInterval = timeout
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body {
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
             request.httpBody = body
         }
         let (data, response) = try await network.data(for: request)

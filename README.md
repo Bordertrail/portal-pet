@@ -2,7 +2,7 @@
 
 ![原创像素信使机器人](desktop/icons/icon.png)
 
-Rust 服务端使用 Axum、WebSocket 和 SQLite。桌面端使用 Tauri 和 Leptos。好友来信时，发送方的机器人会从传送门走出来，带着可点击的文字气泡。
+Rust 服务端使用 Axum、WebSocket 和 SQLite。桌面端使用 Tauri 和 Leptos。好友来信时，发送方的机器人会从传送门走出来，带着可点击的文字气泡。聊天支持图片、Emoji 和图片表情收藏。图片消息需要在服务端配置私有 OSS。
 
 公网部署使用 Docker Compose 和 Caddy，支持公网 IPv4 加端口或域名。 [Linux 部署、发码和备份步骤](deploy/README.md)
 
@@ -48,7 +48,7 @@ cargo run --locked -p portal-pet
 
 ## Windows 客户端
 
-为 Windows 10 或 11 的 x64 电脑构建并运行 `Portal Pet_0.1.6_x64-setup.exe`，安装后从开始菜单打开 Portal Pet。安装程序适用于当前用户，提供简体中文和英文。电脑缺少 Microsoft Edge WebView2 运行时时，安装程序会联网获取。首次打开聊天窗口时输入管理员发放的 6 位安全码。
+为 Windows 10 或 11 的 x64 电脑构建并运行 `Portal Pet_0.1.7_x64-setup.exe`，安装后从开始菜单打开 Portal Pet。安装程序适用于当前用户，提供简体中文和英文。电脑缺少 Microsoft Edge WebView2 运行时时，安装程序会联网获取。首次打开聊天窗口时输入管理员发放的 6 位安全码。
 
 在 Windows 上从源码重新打包时，先安装 Visual Studio C++ 生成工具和 WebView2，再在仓库根目录用 PowerShell 执行以下命令。 [Tauri Windows 构建依赖](https://v2.tauri.app/start/prerequisites/#windows)
 

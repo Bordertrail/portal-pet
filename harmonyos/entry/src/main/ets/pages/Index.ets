@@ -1,6 +1,10 @@
 import { common } from '@kit.AbilityKit';
+import { fileUri } from '@kit.CoreFileKit';
+import { unifiedDataChannel, uniformTypeDescriptor } from '@kit.ArkData';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { ChatStore } from '../chat/ChatStore';
 import { ChatMessage, Member, Person, Relationship, SECURITY_CODE_LENGTH } from '../chat/Protocol';
+import { EMOJI_GROUPS, EmojiGroup, EmojiItem, StickerPicture, StickerShelf, readStickerImage } from '../chat/StickerShelf';
 import { ArrivalCard, CountBadge, MessageHistory, PetAvatar, PortalHero } from './ChatViews';
 
 enum Tab {
@@ -24,9 +28,53 @@ struct Index {
   @State private creatingAccount: boolean = false;
   @State private issuedCode: string = '';
   @State private issuedName: string = '';
+  @State private selectingImage: boolean = false;
+  @State private shelf: StickerShelf = new StickerShelf();
+  @State private showStickers: boolean = false;
+  @State private stickerCategory: string = '笑脸';
+  @State private stickerQuery: string = '';
+  @State private manageStickers: boolean = false;
+  @State private droppingImage: boolean = false;
+
+  private async pickImage(collect: boolean = false): Promise<void> {
+    const peer = this.chat.peer?.id;
+    const account = this.chat.member?.id;
+    if (peer === undefined || this.selectingImage) {
+      return;
+    }
+    this.selectingImage = true;
+    try {
+      const options = new photoAccessHelper.PhotoSelectOptions();
+      options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+      options.maxSelectNumber = 1;
+      const selected = await new photoAccessHelper.PhotoViewPicker().select(options);
+      const uri = selected.photoUris[0];
+      if (!uri || this.chat.peer?.id !== peer) {
+        return;
+      }
+      const data = await readStickerImage(uri);
+      if (this.chat.member?.id !== account || this.chat.peer?.id !== peer) { return; }
+      if (collect) {
+        await this.saveSticker(data);
+      } else {
+        this.chat.selectImage(data);
+      }
+    } catch (error) {
+      if (this.chat.peer?.id === peer) {
+        this.chat.notice = (error as Error).message || '无法读取所选图片。';
+      }
+    } finally {
+      this.selectingImage = false;
+    }
+  }
 
   aboutToAppear(): void {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    try {
+      this.shelf.initialize(context);
+    } catch {
+      this.chat.notice = '无法读取本机表情收藏。';
+    }
     this.chat.restore(context);
   }
 
@@ -43,6 +91,10 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.showStickers) {
+      this.showStickers = false;
+      return true;
+    }
     if (this.chat.peer) {
       this.chat.closeChat();
       return true;
@@ -52,6 +104,86 @@ struct Index {
       return true;
     }
     return false;
+  }
+
+  private async toggleStickers(): Promise<void> {
+    if (this.showStickers) {
+      this.showStickers = false;
+      return;
+    }
+    const account = this.chat.member?.id ?? -1;
+    const peer = this.chat.peer?.id;
+    try {
+      await this.shelf.selectAccount(account, true);
+      if (this.chat.member?.id !== account || this.chat.peer?.id !== peer) { return; }
+      this.stickerCategory = this.shelf.recent.length ? '最近' : '笑脸';
+      this.stickerQuery = '';
+      this.manageStickers = false;
+      this.showStickers = true;
+    } catch {
+      this.chat.notice = '无法读取本机表情收藏。';
+    }
+  }
+
+  private async saveSticker(data: ArrayBuffer): Promise<void> {
+    const account = this.chat.member?.id ?? -1;
+    await this.shelf.selectAccount(account);
+    if (this.chat.member?.id !== account) { return; }
+    await this.shelf.save(data);
+    if (this.chat.member?.id === account) { this.chat.notice = '已收藏为表情。'; }
+  }
+
+  private async saveChatImage(message: ChatMessage): Promise<void> {
+    try {
+      await this.saveSticker(await this.chat.imageData(message));
+    } catch (error) {
+      this.chat.notice = (error as Error).message || '无法收藏这张图片。';
+    }
+  }
+
+  private async usePicture(picture: StickerPicture): Promise<void> {
+    const peer = this.chat.peer?.id;
+    const account = this.chat.member?.id;
+    if (peer === undefined || this.selectingImage) { return; }
+    if (this.manageStickers) {
+      await this.shelf.remove(picture).catch(() => { this.chat.notice = '无法移除表情。'; });
+      return;
+    }
+    this.selectingImage = true;
+    try {
+      const data = await readStickerImage(picture.path);
+      if (this.chat.member?.id === account && this.chat.peer?.id === peer) {
+        this.chat.selectImage(data);
+        this.showStickers = false;
+      }
+    } catch {
+      this.chat.notice = '无法读取这个收藏表情。';
+    } finally {
+      this.selectingImage = false;
+    }
+  }
+
+  private dropImage(event: DragEvent): void {
+    this.droppingImage = false;
+    const peer = this.chat.peer?.id;
+    const account = this.chat.member?.id;
+    if (peer === undefined || this.selectingImage || this.chat.ending || this.chat.sendingPeers.includes(peer)) { return; }
+    try {
+      const record = event.getData().getRecords()[0] as unifiedDataChannel.Image | undefined;
+      if (!record?.imageUri) { return; }
+      event.setResult(DragResult.DRAG_SUCCESSFUL);
+      this.selectingImage = true;
+      readStickerImage(record.imageUri).then((data: ArrayBuffer) => {
+        if (this.chat.member?.id === account && this.chat.peer?.id === peer) {
+          this.showStickers = false;
+          this.chat.selectImage(data);
+        }
+      }).catch(() => {
+        this.chat.notice = '无法读取拖入的图片。';
+      }).finally(() => { this.selectingImage = false; });
+    } catch {
+      this.chat.notice = '无法读取拖入的图片。';
+    }
   }
 
   private async activate(): Promise<void> {
@@ -105,6 +237,7 @@ struct Index {
   }
 
   private open(peer: Member): void {
+    this.showStickers = false;
     this.tab = Tab.Messages;
     this.chat.open(peer);
   }
@@ -585,6 +718,97 @@ struct Index {
   }
 
   @Builder
+  stickerPicker() {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        TextInput({ placeholder: '搜索表情', text: this.stickerQuery })
+          .height(36)
+          .layoutWeight(1)
+          .onChange((text: string) => {
+            this.stickerQuery = text;
+            if (text.trim() && this.stickerCategory === '最近') { this.stickerCategory = '笑脸'; }
+          })
+        Button('关闭').fontSize(13).onClick(() => { this.showStickers = false; })
+      }
+      Scroll() {
+        Row({ space: 5 }) {
+          ForEach(['最近', '收藏', ...EMOJI_GROUPS.map((group: EmojiGroup) => group.name)], (name: string) => {
+            Button(name, { type: ButtonType.Normal })
+              .height(30).fontSize(12).borderRadius(8)
+              .fontColor($r('app.color.accent'))
+              .backgroundColor(name === this.stickerCategory ? '#e9dcfa' : $r('app.color.wash'))
+              .onClick(() => { this.stickerCategory = name; this.stickerQuery = ''; })
+          }, (name: string) => name)
+        }
+      }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%')
+      Scroll() {
+        Column({ space: 7 }) {
+          if (this.shelf.choices(this.stickerCategory, this.stickerQuery).length === 0 && this.stickerCategory !== '收藏') {
+            Text(this.stickerQuery ? '没有找到表情' : '用过的表情会出现在这里')
+              .fontSize(13).fontColor($r('app.color.muted'))
+          }
+          Flex({ wrap: FlexWrap.Wrap }) {
+            ForEach(this.shelf.choices(this.stickerCategory, this.stickerQuery), (item: EmojiItem) => {
+              Stack({ alignContent: Alignment.TopEnd }) {
+                Button(item.glyph, { type: ButtonType.Normal })
+                  .width(44).height(39).fontSize(23)
+                  .backgroundColor(Color.Transparent)
+                  .accessibilityText(item.name)
+                  .onClick(() => {
+                    const text = this.chat.draft + item.glyph;
+                    if (Array.from(text).length <= 2000) {
+                      this.chat.editDraft(text);
+                      this.shelf.used(item.glyph).catch(() => { this.chat.notice = '无法保存最近使用。'; });
+                    }
+                  })
+                Button(this.shelf.favorites.includes(item.glyph) ? '★' : '☆', { type: ButtonType.Normal })
+                  .width(23).height(22).padding(0).fontSize(10)
+                  .fontColor('#76501F').backgroundColor(Color.Transparent)
+                  .accessibilityText(this.shelf.favorites.includes(item.glyph) ? '取消收藏 ' + item.name : '收藏 ' + item.name)
+                  .onClick(() => {
+                    this.shelf.toggle(item.glyph).catch(() => { this.chat.notice = '无法保存表情收藏。'; });
+                  })
+              }
+              .width(47).height(39)
+            }, (item: EmojiItem) => item.glyph)
+          }
+          if (this.stickerCategory === '收藏' && !this.stickerQuery.trim()) {
+            Row({ space: 6 }) {
+              Text('图片表情').layoutWeight(1).fontSize(14).fontWeight(FontWeight.Medium)
+              Button('导入图片').fontSize(12)
+                .enabled(!this.selectingImage && !this.shelf.busy).onClick(() => { this.pickImage(true); })
+              Button(this.manageStickers ? '完成' : '管理').fontSize(12)
+                .enabled(this.shelf.pictures.length > 0).onClick(() => { this.manageStickers = !this.manageStickers; })
+            }.width('100%')
+            if (this.shelf.pictures.length === 0) {
+              Text('点聊天图片的 ☆，或导入自己的图片').fontSize(13).fontColor($r('app.color.muted'))
+            }
+            Flex({ wrap: FlexWrap.Wrap }) {
+              ForEach(this.shelf.pictures, (picture: StickerPicture) => {
+                Button({ type: ButtonType.Normal }) {
+                  Stack({ alignContent: Alignment.TopEnd }) {
+                    Image(fileUri.getUriFromPath(picture.path))
+                      .width(48).height(48).objectFit(ImageFit.Contain)
+                    if (this.manageStickers) { Text('×').fontSize(13).fontColor('#76501F') }
+                  }
+                }
+                .width(55).height(55).padding(3).margin(2)
+                .backgroundColor($r('app.color.wash'))
+                .enabled(!this.shelf.busy && !this.selectingImage)
+                .accessibilityText(this.manageStickers ? '移除图片表情' : '使用图片表情')
+                .onClick(() => { this.usePicture(picture); })
+              }, (picture: StickerPicture) => picture.name)
+            }
+          }
+        }.width('100%').alignItems(HorizontalAlign.Start)
+      }.height(155).width('100%').align(Alignment.TopStart)
+    }
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .width('100%')
+    .backgroundColor($r('app.color.surface'))
+  }
+
+  @Builder
   conversation() {
     Column() {
       Row({ space: 10 }) {
@@ -595,7 +819,7 @@ struct Index {
           .fontColor($r('app.color.accent'))
           .backgroundColor($r('app.color.wash'))
           .accessibilityText('返回消息列表')
-          .onClick(() => this.chat.closeChat())
+          .onClick(() => { this.showStickers = false; this.chat.closeChat(); })
         PetAvatar({ memberId: this.chat.peer?.id ?? -1, avatar: this.chat.peer?.avatar ?? 'default', size: 40 })
         Text(this.chat.peer?.nickname ?? '')
           .layoutWeight(1)
@@ -615,35 +839,67 @@ struct Index {
       .padding({ left: 16, right: 16, top: 8, bottom: 8 })
       this.notice()
 
-      Column() {
+      Stack() {
         MessageHistory({
           messages: this.chat.messagesFor(this.chat.peer?.id ?? -1),
           memberId: this.chat.member?.id ?? -1,
-          peerId: this.chat.peer?.id ?? -1
+          peerId: this.chat.peer?.id ?? -1,
+          loadImage: (message: ChatMessage) => this.chat.imageData(message),
+          saveImage: (message: ChatMessage) => { this.saveChatImage(message); }
         })
+        if (this.droppingImage) {
+          Text('松开添加图片')
+            .padding(16).borderRadius(14)
+            .fontColor($r('app.color.accent')).backgroundColor($r('app.color.surface'))
+            .hitTestBehavior(HitTestMode.None)
+        }
       }
       .width('100%')
       .layoutWeight(1)
+      .allowDrop([uniformTypeDescriptor.UniformDataType.IMAGE])
+      .onDragEnter(() => { this.droppingImage = true; })
+      .onDragLeave(() => { this.droppingImage = false; })
+      .onDrop((event: DragEvent) => { this.dropImage(event); })
 
+      if (this.showStickers) { this.stickerPicker() }
       Row({ space: 8 }) {
-        TextArea({ placeholder: '输入消息', text: this.chat.draft })
-          .layoutWeight(1)
-          .height(50)
-          .maxLength(4000)
-          .fontSize(16)
-          .fontColor($r('app.color.ink'))
-          .placeholderColor($r('app.color.muted'))
-          .backgroundColor($r('app.color.wash'))
-          .borderRadius(14)
+        Button('☺')
+          .height(44).width(42).fontSize(18)
+          .backgroundColor($r('app.color.wash')).fontColor($r('app.color.accent'))
+          .accessibilityText('表情与收藏')
           .enabled(!this.chat.ending && !this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1))
-          .accessibilityText('输入消息')
-          .onChange((value: string) => this.chat.editDraft(value))
+          .onClick(() => { this.toggleStickers(); })
+        Button('图片')
+          .height(44)
+          .backgroundColor($r('app.color.wash'))
+          .fontColor($r('app.color.accent'))
+          .enabled(!this.selectingImage && !this.chat.ending && !this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1))
+          .onClick(() => { this.showStickers = false; this.pickImage(); })
+        if (this.chat.imageDraft) {
+          Text('已选图片').layoutWeight(1).fontColor($r('app.color.ink'))
+          Button('移除', { type: ButtonType.Normal })
+            .enabled(!this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1))
+            .onClick(() => { this.chat.imageDraft = undefined; })
+        } else {
+          TextArea({ placeholder: '输入消息', text: this.chat.draft })
+            .layoutWeight(1)
+            .height(50)
+            .maxLength(4000)
+            .fontSize(16)
+            .fontColor($r('app.color.ink'))
+            .placeholderColor($r('app.color.muted'))
+            .backgroundColor($r('app.color.wash'))
+            .borderRadius(14)
+            .enabled(!this.chat.ending && !this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1))
+            .accessibilityText('输入消息')
+            .onChange((value: string) => this.chat.editDraft(value))
+        }
         Button(this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1) ? '发送中' : '发送')
           .height(44)
           .backgroundColor('#6241BC')
-          .enabled(!!this.chat.draft.trim() && !this.chat.ending &&
+          .enabled((!!this.chat.imageDraft || !!this.chat.draft.trim()) && !this.selectingImage && !this.chat.ending &&
             !this.chat.sendingPeers.includes(this.chat.peer?.id ?? -1))
-          .onClick(() => { this.chat.send(); })
+          .onClick(() => { this.showStickers = false; this.chat.send(); })
       }
       .width('100%')
       .padding({ left: 14, right: 14, top: 8, bottom: 8 })

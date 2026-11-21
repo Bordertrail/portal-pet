@@ -84,6 +84,18 @@ export class PortalApi {
       JSON.stringify(payload));
   }
 
+  sendImage(session: Session, peerId: number, id: string, data: ArrayBuffer): Promise<ChatMessage> {
+    return this.read<ChatMessage>(session.server, 'message-images/' + peerId + '/' + id, 'POST', session.token, data);
+  }
+
+  async image(session: Session, id: number): Promise<ArrayBuffer> {
+    const response = await this.request(session.server, 'message-images/' + id, 'GET', session.token, undefined, true);
+    if (!response.body) {
+      throw new Error('无法读取图片。');
+    }
+    return response.body;
+  }
+
   async logout(session: Session): Promise<void> {
     await this.request(session.server, 'session/logout', 'POST', session.token);
   }
@@ -93,27 +105,28 @@ export class PortalApi {
   }
 
   private async read<T>(server: string, path: string, method: rcp.HttpMethod, token: string,
-    body?: string): Promise<T> {
+    body?: string | ArrayBuffer): Promise<T> {
     const content = await this.request(server, path, method, token, body);
     try {
-      return JSON.parse(content) as T;
+      return JSON.parse(content.toString() ?? '') as T;
     } catch {
       throw new Error('无法读取服务器响应。');
     }
   }
 
   private async request(server: string, path: string, method: rcp.HttpMethod, token: string,
-    body?: string): Promise<string> {
-    const headers: rcp.RequestHeaders = { 'accept': 'application/json' };
+    body?: string | ArrayBuffer, download: boolean = false): Promise<rcp.Response> {
+    const binary = body instanceof ArrayBuffer;
+    const headers: rcp.RequestHeaders = { 'accept': download ? 'image/*' : 'application/json' };
     if (token) {
       headers.authorization = 'Bearer ' + token;
     }
     if (body !== undefined) {
-      headers['content-type'] = 'application/json';
+      headers['content-type'] = binary ? 'application/octet-stream' : 'application/json';
     }
     const request = new rcp.Request(server + '/api/v1/' + path, method, headers, body);
     const connection = rcp.createSession({
-      requestConfiguration: { transfer: { autoRedirect: false, timeout: { connectMs: 8000, transferMs: 12000 } } }
+      requestConfiguration: { transfer: { autoRedirect: false, timeout: { connectMs: 8000, transferMs: binary || download ? 60000 : 12000 } } }
     });
     let response: rcp.Response;
     try {
@@ -123,11 +136,10 @@ export class PortalApi {
     } finally {
       connection.close();
     }
-    const content = response.toString() ?? '';
     if (response.statusCode < 200 || response.statusCode >= 300) {
       let message = '服务器返回 HTTP ' + response.statusCode + '。';
       try {
-        const failure = JSON.parse(content) as Failure;
+        const failure = JSON.parse(response.toString() ?? '') as Failure;
         if (failure?.message) {
           message = failure.message;
         }
@@ -136,6 +148,6 @@ export class PortalApi {
       }
       throw new PortalError(response.statusCode, message);
     }
-    return content;
+    return response;
   }
 }

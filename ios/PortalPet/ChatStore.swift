@@ -41,6 +41,12 @@ final class ChatStore: ObservableObject {
 
     private let api: PortalAPI
     private let preferences: UserDefaults
+    private let imageCache: NSCache<NSNumber, NSData> = {
+        let cache = NSCache<NSNumber, NSData>()
+        cache.totalCostLimit = 32 * 1024 * 1024
+        cache.countLimit = 96
+        return cache
+    }()
     private var active = false
     private var visiblePeer: Int64?
     private var seenThrough: [Int64: Int64] = [:]
@@ -187,10 +193,39 @@ final class ChatStore: ObservableObject {
     }
 
     func send(_ peer: Int64, body: String, id: UUID) async -> Bool {
+        await transmit(to: peer) { try await api.send(peer, body: body, id: id, $0) }
+    }
+
+    func sendImage(_ peer: Int64, data: Data, id: UUID) async -> Bool {
+        await transmit(to: peer, photo: data) { try await api.sendImage(peer, data: data, id: id, $0) }
+    }
+
+    func imageData(_ message: ChatMessage) async throws -> Data {
+        guard let current = session, let image = message.image,
+              image.bytes > 0 && image.bytes <= PortalAPI.maxImageBytes else { throw PortalError.invalidResponse }
+        let key = NSNumber(value: message.id)
+        if let cached = imageCache.object(forKey: key), cached.length == image.bytes {
+            return cached as Data
+        }
+        do {
+            let data = try await api.image(message.id, current)
+            guard session == current, data.count == image.bytes else { throw PortalError.invalidResponse }
+            imageCache.setObject(data as NSData, forKey: key, cost: data.count)
+            return data
+        } catch {
+            if case PortalError.server(401, _) = error { report(error, for: current) }
+            throw error
+        }
+    }
+
+    private func transmit(to peer: Int64, photo: Data? = nil, request: (ChatSession) async throws -> ChatMessage) async -> Bool {
         guard let current = session else { return false }
         do {
-            let sent = try await api.send(peer, body: body, id: id, current)
+            let sent = try await request(current)
             guard session == current else { return false }
+            if let photo, sent.image?.bytes == photo.count {
+                imageCache.setObject(photo as NSData, forKey: NSNumber(value: sent.id), cost: photo.count)
+            }
             merge([sent], for: peer, session: current)
             return true
         } catch {
@@ -403,6 +438,7 @@ final class ChatStore: ObservableObject {
         dismissArrival()
         let cleared = SessionKeychain.clear()
         session = nil
+        imageCache.removeAllObjects()
         profileMember = nil
         isAdmin = false
         people = []

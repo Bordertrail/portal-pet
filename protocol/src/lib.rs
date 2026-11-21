@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_SERVER_ADDRESS: &str = "http://127.0.0.1:8765";
 pub const SECURITY_CODE_LENGTH: usize = 6;
+pub const IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSticker {
+    pub id: String,
+    pub name: String,
+    pub content_type: String,
+    pub bytes: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -122,12 +131,22 @@ pub struct SendMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageInfo {
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: i64,
     pub sender: Member,
     pub recipient_id: i64,
     pub body: String,
     pub sent_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageInfo>,
 }
 
 impl Message {

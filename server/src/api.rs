@@ -7,6 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, State, WebSocketUpgrade,
         ws::{Message as Frame, WebSocket},
@@ -17,20 +18,26 @@ use axum::{
 };
 use portal_protocol::{
     Activate, Activated, ApiError, Avatar, AvatarChange, ConversationEnd, Directory, Event,
-    FriendAnswer, IssuedAccount, Member, Message, NicknameChange, Person, Relationship,
-    SECURITY_CODE_LENGTH, SendMessage,
+    FriendAnswer, IMAGE_MAX_BYTES, ImageInfo, IssuedAccount, Member, Message, NicknameChange,
+    Person, Relationship, SECURITY_CODE_LENGTH, SendMessage,
 };
-use sqlx::SqlitePool;
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::store;
+use crate::{oss, store};
+
+#[cfg(test)]
+#[path = "api_tests.rs"]
+mod tests;
 
 type Shared = Arc<App>;
 type ApiResult<T> = Result<T, Fault>;
 
 struct App {
     pool: SqlitePool,
+    storage: Option<oss::Storage>,
     trust_proxy: bool,
     online: Mutex<HashMap<i64, usize>>,
     activation_attempts: Mutex<ActivationAttempts>,
@@ -71,10 +78,11 @@ impl App {
     }
 }
 
-pub fn router(pool: SqlitePool, trust_proxy: bool) -> Router {
+pub fn router(pool: SqlitePool, trust_proxy: bool, storage: Option<oss::Storage>) -> Router {
     let (events, _) = broadcast::channel(128);
     let app = Arc::new(App {
         pool,
+        storage,
         trust_proxy,
         online: Mutex::new(HashMap::new()),
         activation_attempts: Mutex::new(ActivationAttempts {
@@ -95,8 +103,13 @@ pub fn router(pool: SqlitePool, trust_proxy: bool) -> Router {
         .route("/api/v1/friends/{peer}/answer", post(answer_friend))
         .route("/api/v1/messages/{peer}", get(history).post(send_message))
         .route("/api/v1/messages/{peer}/end", post(end_conversation))
+        .route("/api/v1/message-images/{id}", get(download_image))
         .route("/api/v1/events", get(websocket))
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .route(
+            "/api/v1/message-images/{peer}/{client_id}",
+            post(send_image).layer(DefaultBodyLimit::max(IMAGE_MAX_BYTES)),
+        )
         .with_state(app)
 }
 
@@ -573,7 +586,6 @@ async fn send_message(
     Path(peer): Path<i64>,
     Json(input): Json<SendMessage>,
 ) -> ApiResult<Json<Message>> {
-    let (low, high) = other(auth.member.id, peer)?;
     let body = input.body.trim();
     if !(1..=2000).contains(&body.chars().count()) {
         return Err(Fault(
@@ -581,33 +593,75 @@ async fn send_message(
             "消息必须有 1 至 2000 个字符",
         ));
     }
-    let client_id = Uuid::parse_str(&input.client_id)
-        .map_err(|_| Fault(StatusCode::BAD_REQUEST, "无效的消息编号"))?
-        .to_string();
+    let client_id = message_client_id(&input.client_id)?;
+    let (message, _) = save_message(&app, &auth, peer, &client_id, body, None).await?;
+    Ok(Json(message))
+}
+
+const IMAGE_BODY: &str = "[图片]";
+const MESSAGE_BY_CLIENT_ID: &str =
+    "SELECT msg.*, m.nickname, m.avatar FROM messages msg JOIN members m ON m.id = msg.sender_id
+     WHERE msg.sender_id = ? AND msg.client_id = ?";
+
+fn message_client_id(value: &str) -> ApiResult<String> {
+    Uuid::parse_str(value)
+        .map(|id| id.to_string())
+        .map_err(|_| Fault(StatusCode::BAD_REQUEST, "无效的消息编号"))
+}
+
+fn saved_message(
+    row: &SqliteRow,
+    peer: i64,
+    body: &str,
+    digest: Option<&str>,
+) -> ApiResult<Message> {
+    let message = store::row_message(row)?;
+    let key: Option<String> = row.try_get("image_key")?;
+    let saved_digest = key
+        .as_deref()
+        .and_then(|key| key.rsplit_once('-').map(|(_, digest)| digest));
+    if message.recipient_id != peer || message.body != body || saved_digest != digest {
+        return Err(Fault(StatusCode::CONFLICT, "消息编号已用于其他内容"));
+    }
+    Ok(message)
+}
+
+struct ImageObject {
+    key: String,
+    digest: String,
+    info: ImageInfo,
+}
+
+async fn save_message(
+    app: &App,
+    auth: &Auth,
+    peer: i64,
+    client_id: &str,
+    body: &str,
+    image: Option<&ImageObject>,
+) -> ApiResult<(Message, bool)> {
+    let (low, high) = other(auth.member.id, peer)?;
     let mut tx = app.pool.begin().await?;
     let inserted = sqlx::query(
-        "INSERT INTO messages(sender_id, recipient_id, client_id, body)
-         SELECT ?, ?, ?, ?
+        "INSERT INTO messages(sender_id, recipient_id, client_id, body, image_key, image_type, image_width, image_height, image_bytes)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE EXISTS (SELECT 1 FROM relationships WHERE member_low = ? AND member_high = ? AND accepted = 1)
            AND EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1)
            AND EXISTS (SELECT 1 FROM sessions WHERE token_hash = ? AND member_id = ?)
          ON CONFLICT(sender_id, client_id) DO NOTHING",
-    ).bind(auth.member.id).bind(peer).bind(&client_id).bind(body)
+    ).bind(auth.member.id).bind(peer).bind(client_id).bind(body)
+      .bind(image.map(|image| &image.key)).bind(image.map(|image| &image.info.content_type))
+      .bind(image.map(|image| image.info.width)).bind(image.map(|image| image.info.height))
+      .bind(image.map(|image| image.info.bytes))
       .bind(low).bind(high).bind(peer).bind(&auth.token_hash).bind(auth.member.id)
       .execute(&mut *tx).await?.rows_affected() == 1;
-    let row = sqlx::query(
-        "SELECT msg.*, m.nickname, m.avatar FROM messages msg JOIN members m ON m.id = msg.sender_id
-         WHERE msg.sender_id = ? AND msg.client_id = ?",
-    )
-    .bind(auth.member.id)
-    .bind(&client_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(forbidden)?;
-    let message = store::row_message(&row)?;
-    if message.recipient_id != peer || message.body != body {
-        return Err(Fault(StatusCode::CONFLICT, "消息编号已用于其他内容"));
-    }
+    let row = sqlx::query(MESSAGE_BY_CLIENT_ID)
+        .bind(auth.member.id)
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(forbidden)?;
+    let message = saved_message(&row, peer, body, image.map(|image| image.digest.as_str()))?;
     tx.commit().await?;
     if inserted {
         app.publish(
@@ -617,7 +671,129 @@ async fn send_message(
             },
         );
     }
-    Ok(Json(message))
+    Ok((message, inserted))
+}
+
+fn storage(app: &App) -> ApiResult<&oss::Storage> {
+    app.storage.as_ref().ok_or(Fault(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "服务器尚未启用图片消息",
+    ))
+}
+
+fn storage_fault(error: anyhow::Error) -> Fault {
+    eprintln!("OSS request failed: {error}");
+    Fault(StatusCode::BAD_GATEWAY, "暂时无法访问图片存储，请稍后重试")
+}
+
+fn image_info(body: &[u8]) -> ApiResult<ImageInfo> {
+    use imagesize::ImageType;
+    let unsupported = || {
+        Fault(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "请选择 JPEG、PNG 或 WebP 图片",
+        )
+    };
+    let content_type = match imagesize::image_type(body) {
+        Ok(ImageType::Jpeg) => "image/jpeg",
+        Ok(ImageType::Png) => "image/png",
+        Ok(ImageType::Webp) => "image/webp",
+        _ => return Err(unsupported()),
+    };
+    let size = imagesize::blob_size(body).map_err(|_| unsupported())?;
+    if size.width == 0
+        || size.height == 0
+        || size.width > 8192
+        || size.height > 8192
+        || size.width * size.height > 32_000_000
+    {
+        return Err(Fault(StatusCode::BAD_REQUEST, "图片尺寸过大或无效"));
+    }
+    Ok(ImageInfo {
+        content_type: content_type.into(),
+        width: size.width as u32,
+        height: size.height as u32,
+        bytes: body.len() as u32,
+    })
+}
+
+async fn send_image(
+    State(app): State<Shared>,
+    auth: Auth,
+    Path((peer, client_id)): Path<(i64, String)>,
+    body: Bytes,
+) -> ApiResult<Json<Message>> {
+    storage(&app)?;
+    let (low, high) = other(auth.member.id, peer)?;
+    let accepted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM relationships WHERE member_low = ? AND member_high = ? AND accepted = 1)
+           AND EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1)",
+    ).bind(low).bind(high).bind(peer).fetch_one(&app.pool).await?;
+    if !accepted {
+        return Err(forbidden());
+    }
+    let client_id = message_client_id(&client_id)?;
+    let info = image_info(&body)?;
+    let digest = format!("{:x}", Sha256::digest(&body));
+    if let Some(row) = sqlx::query(MESSAGE_BY_CLIENT_ID)
+        .bind(auth.member.id)
+        .bind(&client_id)
+        .fetch_optional(&app.pool)
+        .await?
+    {
+        return Ok(Json(saved_message(&row, peer, IMAGE_BODY, Some(&digest))?));
+    }
+    let image = ImageObject {
+        key: format!("portal-pet/images/{}-{digest}", Uuid::new_v4()),
+        digest,
+        info,
+    };
+    // Once the upload starts, finish the SQLite write or cleanup even if the caller disconnects.
+    tokio::spawn(async move {
+        let storage = storage(&app)?;
+        storage.put(&image.key, &image.info.content_type, body).await.map_err(storage_fault)?;
+        let result = save_message(&app, &auth, peer, &client_id, IMAGE_BODY, Some(&image)).await;
+        if !matches!(&result, Ok((_, true))) {
+            // Attempts use distinct keys. Check SQLite before deleting in case a commit succeeded.
+            let stored = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE sender_id = ? AND client_id = ? AND image_key = ?)",
+            ).bind(auth.member.id).bind(&client_id).bind(&image.key).fetch_one(&app.pool).await;
+            if matches!(stored, Ok(false)) && let Err(error) = storage.delete(&image.key).await {
+                eprintln!("OSS cleanup failed: {error}");
+            }
+        }
+        result.map(|(message, _)| Json(message))
+    }).await.map_err(|_| Fault(StatusCode::INTERNAL_SERVER_ERROR, "暂时无法发送图片"))?
+}
+
+async fn download_image(
+    State(app): State<Shared>,
+    auth: Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let row: Option<(String, String, u32)> = sqlx::query_as(
+        "SELECT image_key, image_type, image_bytes FROM messages
+         WHERE id = ? AND image_key IS NOT NULL AND (sender_id = ? OR recipient_id = ?)",
+    )
+    .bind(id)
+    .bind(auth.member.id)
+    .bind(auth.member.id)
+    .fetch_optional(&app.pool)
+    .await?;
+    let (key, content_type, size) = row.ok_or(Fault(StatusCode::NOT_FOUND, "找不到这张图片"))?;
+    let bytes = storage(&app)?
+        .get(&key, size as usize)
+        .await
+        .map_err(storage_fault)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.as_str()),
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 struct Presence {

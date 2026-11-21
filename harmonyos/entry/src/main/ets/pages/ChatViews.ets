@@ -1,3 +1,4 @@
+import { image } from '@kit.ImageKit';
 import { ChatMessage } from '../chat/Protocol';
 
 function petImage(memberId: number, avatar: string = 'default'): Resource {
@@ -239,10 +240,103 @@ export struct ArrivalCard {
 }
 
 @Component
+struct ChatPhoto {
+  @Prop message: ChatMessage;
+  loadImage: (message: ChatMessage) => Promise<ArrayBuffer> = async () => new ArrayBuffer(0);
+  saveImage: (message: ChatMessage) => void = () => {};
+  @State bitmap?: image.PixelMap;
+  @State failed: boolean = false;
+  private loading: boolean = false;
+  private visible: boolean = false;
+
+  aboutToAppear(): void {
+    this.visible = true;
+  }
+
+  aboutToDisappear(): void {
+    this.visible = false;
+    const bitmap = this.bitmap;
+    this.bitmap = undefined;
+    if (bitmap) {
+      bitmap.release().catch(() => {});
+    }
+  }
+
+  private async load(): Promise<void> {
+    if (this.loading || this.bitmap || !this.visible) {
+      return;
+    }
+    this.loading = true;
+    this.failed = false;
+    try {
+      const data = await this.loadImage(this.message);
+      const source = image.createImageSource(data);
+      try {
+        const info = this.message.image;
+        const scale = Math.min(1, 640 / Math.max(info?.width ?? 1, info?.height ?? 1));
+        const size: image.Size = {
+          width: Math.max(1, Math.round((info?.width ?? 1) * scale)),
+          height: Math.max(1, Math.round((info?.height ?? 1) * scale))
+        };
+        const bitmap = await source.createPixelMap({ desiredSize: size });
+        if (this.visible) {
+          this.bitmap = bitmap;
+        } else {
+          await bitmap.release();
+        }
+      } finally {
+        await source.release();
+      }
+    } catch {
+      if (this.visible) {
+        this.failed = true;
+      }
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      Stack() {
+        if (this.bitmap) {
+          Image(this.bitmap).width('100%').height('100%').objectFit(ImageFit.Contain).accessibilityText('聊天图片')
+        } else if (this.failed) {
+          Button('图片未加载，点此重试').fontSize(12).onClick(() => { this.load(); })
+        } else {
+          LoadingProgress().width(22).height(22).accessibilityText('正在加载图片')
+        }
+      }.width('100%').height('100%')
+      if (this.bitmap) {
+        Button('☆', { type: ButtonType.Circle })
+          .width(32).height(32).fontSize(18)
+          .fontColor($r('app.color.accent'))
+          .backgroundColor($r('app.color.surface'))
+          .margin(5)
+          .accessibilityText('收藏为表情')
+          .onClick(() => this.saveImage(this.message))
+      }
+    }
+    .width(185)
+    .height(Math.min(185, Math.max(68, 185 * (this.message.image?.height ?? 1) / (this.message.image?.width ?? 1))))
+    .backgroundColor($r('app.color.wash'))
+    .borderRadius(12)
+    .clip(true)
+    .onVisibleAreaChange([0.1], (visible: boolean) => {
+      if (visible && !this.failed) {
+        this.load();
+      }
+    })
+  }
+}
+
+@Component
 export struct MessageHistory {
   @Prop @Watch('messagesChanged') messages: ChatMessage[] = [];
   @Prop memberId: number = -1;
   @Prop @Watch('peerChanged') peerId: number = -1;
+  loadImage: (message: ChatMessage) => Promise<ArrayBuffer> = async () => new ArrayBuffer(0);
+  saveImage: (message: ChatMessage) => void = () => {};
   private scroller: Scroller = new Scroller();
   private timer: number = -1;
   private endIndex: number = -1;
@@ -290,13 +384,17 @@ export struct MessageHistory {
         PetAvatar({ memberId: this.peerId, avatar: message.sender.avatar ?? 'default', size: 34 })
       }
       Column({ space: 5 }) {
-        Text(message.body)
-          .fontSize(16)
-          .fontColor(message.sender.id === this.memberId ? Color.White : $r('app.color.ink'))
-          .wordBreak(WordBreak.BREAK_WORD)
-          .padding({ left: 14, right: 14, top: 9, bottom: 9 })
-          .backgroundColor(message.sender.id === this.memberId ? '#6241BC' : $r('app.color.surface'))
-          .borderRadius(16)
+        if (message.image) {
+          ChatPhoto({ message: message, loadImage: this.loadImage, saveImage: this.saveImage })
+        } else {
+          Text(message.body)
+            .fontSize(16)
+            .fontColor(message.sender.id === this.memberId ? Color.White : $r('app.color.ink'))
+            .wordBreak(WordBreak.BREAK_WORD)
+            .padding({ left: 14, right: 14, top: 9, bottom: 9 })
+            .backgroundColor(message.sender.id === this.memberId ? '#6241BC' : $r('app.color.surface'))
+            .borderRadius(16)
+        }
         Text(this.timeLabel(message.sent_at))
           .fontSize(11)
           .fontColor($r('app.color.muted'))

@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::{Result, ensure};
-use portal_protocol::{Activated, Avatar, Member, Message, SECURITY_CODE_LENGTH};
+use portal_protocol::{Activated, Avatar, ImageInfo, Member, Message, SECURITY_CODE_LENGTH};
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, SqliteConnection, SqlitePool,
@@ -243,6 +243,16 @@ pub fn pair(first: i64, second: i64) -> (i64, i64) {
 }
 
 pub fn row_message(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Message> {
+    let image = if let Some(content_type) = row.try_get::<Option<String>, _>("image_type")? {
+        Some(ImageInfo {
+            content_type,
+            width: row.try_get("image_width")?,
+            height: row.try_get("image_height")?,
+            bytes: row.try_get("image_bytes")?,
+        })
+    } else {
+        None
+    };
     Ok(Message {
         id: row.try_get("id")?,
         sender: Member {
@@ -253,5 +263,6 @@ pub fn row_message(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Message> {
         recipient_id: row.try_get("recipient_id")?,
         body: row.try_get("body")?,
         sent_at: row.try_get("sent_at")?,
+        image,
     })
 }

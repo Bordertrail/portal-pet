@@ -13,6 +13,9 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
     fn invoke(command: &str, args: JsValue) -> Promise;
 
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
+    fn invoke_with_options(command: &str, args: JsValue, options: JsValue) -> Promise;
+
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
     fn listen(event: &str, callback: &Function) -> Promise;
 }
@@ -288,15 +291,28 @@ fn Visitor() -> impl IntoView {
         .and_then(|window| Reflect::get(&window, &JsValue::from_str("portalVisitor")).ok())
         .and_then(|value| serde_wasm_bindgen::from_value::<Member>(value).ok());
     let profile = RwSignal::new(peer);
+    let unread = RwSignal::new(0u32);
     let label = move || {
+        let count = unread.get();
         profile.with(|peer| {
             peer.as_ref().map_or_else(
                 || "打开聊天".to_owned(),
-                |member| format!("与{}聊天", member.nickname),
+                |member| {
+                    if count == 0 {
+                        format!("与{}聊天", member.nickname)
+                    } else {
+                        format!("打开{}的聊天，{count} 条未读消息", member.nickname)
+                    }
+                },
             )
         })
     };
     spawn_local(async move {
+        if let Err(error) =
+            listen_payload("portal-visitor-unread", move |count| unread.set(count)).await
+        {
+            leptos::logging::error!("portal-visitor-unread: {error:?}");
+        }
         if let Err(error) = listen_payload("portal-visitor-profile", move |member| {
             profile.set(Some(member))
         })
@@ -319,6 +335,17 @@ fn Visitor() -> impl IntoView {
                 let avatar = peer.map_or(Avatar::Default, |member| member.avatar);
                 view! { <Sprite palette=palette avatar=avatar motion=AvatarMotion::Idle/> }
             }}
+            <For each=move || Some(unread.get()).filter(|count| *count > 0)
+                key=|count| *count
+                children=move |count| {
+                    let badge = if count > 9 { "9+".to_owned() } else { count.to_string() };
+                    view! {
+                        <span class="visitor-mail" aria-hidden="true">
+                            <span class="mail-envelope"></span>
+                            <span class="mail-count">{badge}</span>
+                        </span>
+                    }
+                }/>
         </button>
     }
 }
@@ -371,7 +398,7 @@ fn friend_palette(peer: Option<i64>) -> u8 {
 
 #[derive(Serialize)]
 struct OpenArrival {
-    generation: u64,
+    peer: i64,
 }
 
 #[component]
@@ -391,7 +418,7 @@ fn Bubble() -> impl IntoView {
                 let _ = request::<_, ()>(
                     "open_arrival",
                     OpenArrival {
-                        generation: message.generation,
+                        peer: message.peer.id,
                     },
                 )
                 .await;

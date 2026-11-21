@@ -9,9 +9,11 @@ rust-version.workspace = true
 leptos = { version = "0.8", features = ["csr"] }
 portal-protocol = { path = "../protocol" }
 serde = "1"
+serde_json = "1"
 serde-wasm-bindgen = "0.6"
+send_wrapper = "0.6"
 uuid = { version = "1", features = ["v4", "js"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Element", "PointerEvent", "Window"] }
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "CanvasRenderingContext2d", "ClipboardEvent", "DataTransfer", "Document", "DragEvent", "Element", "File", "FileList", "FilePropertyBag", "HtmlCanvasElement", "HtmlDialogElement", "HtmlImageElement", "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit", "PointerEvent", "Storage", "Url", "Window"] }

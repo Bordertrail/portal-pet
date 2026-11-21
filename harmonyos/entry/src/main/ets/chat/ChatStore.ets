@@ -4,7 +4,7 @@ import { webSocket } from '@kit.NetworkKit';
 import { ChatPreferences, clearSession, loadSession, saveSession } from './LocalData';
 import { PortalApi, PortalError, portalOrigin } from './PortalApi';
 import {
-  ChatMessage, Conversation, ConversationEnd, DEFAULT_SERVER_ADDRESS, Draft, IssuedAccount, Member, OutgoingMessage, Person,
+  ChatMessage, Conversation, ConversationEnd, DEFAULT_SERVER_ADDRESS, Draft, IssuedAccount, MAX_IMAGE_BYTES, Member, OutgoingMessage, Person,
   PortalEvent, Relationship, Session
 } from './Protocol';
 
@@ -19,6 +19,15 @@ class SocketHeaders {
 
   constructor(token: string) {
     this.Authorization = 'Bearer ' + token;
+  }
+}
+
+class ImageDraft {
+  readonly id: string = util.generateRandomUUID();
+  readonly data: ArrayBuffer;
+
+  constructor(data: ArrayBuffer) {
+    this.data = data;
   }
 }
 
@@ -40,6 +49,7 @@ export class ChatStore {
   refreshing: boolean = false;
   directoryLoaded: boolean = false;
   draft: string = '';
+  imageDraft?: ImageDraft;
   sendingPeers: number[] = [];
   pendingFriends: number[] = [];
 
@@ -57,6 +67,8 @@ export class ChatStore {
   private syncRevision: number = 0;
   private readThrough: Map<number, number> = new Map();
   private drafts: Map<number, Draft> = new Map();
+  private imageCache: Map<number, ArrayBuffer> = new Map();
+  private imageCacheBytes: number = 0;
 
   async restore(context: common.UIAbilityContext): Promise<void> {
     try {
@@ -249,6 +261,9 @@ export class ChatStore {
     if (!session || this.signingOut) {
       return;
     }
+    if (this.peer?.id !== peer.id) {
+      this.imageDraft = undefined;
+    }
     this.peer = peer;
     this.draft = this.drafts.get(peer.id)?.body ?? '';
     this.dismissArrival();
@@ -263,6 +278,7 @@ export class ChatStore {
   closeChat(): void {
     this.peer = undefined;
     this.draft = '';
+    this.imageDraft = undefined;
   }
 
   async endConversation(): Promise<void> {
@@ -307,29 +323,85 @@ export class ChatStore {
     this.drafts.set(peer.id, { body, request: previous?.body === body.trim() ? previous : undefined });
   }
 
+  selectImage(data: ArrayBuffer): void {
+    this.notice = '';
+    this.imageDraft = new ImageDraft(data);
+  }
+
+  async imageData(message: ChatMessage): Promise<ArrayBuffer> {
+    const session = this.session;
+    const info = message.image;
+    if (!session || !info || info.bytes <= 0 || info.bytes > MAX_IMAGE_BYTES) {
+      throw new Error('无效的聊天图片。');
+    }
+    const cached = this.imageCache.get(message.id);
+    if (cached?.byteLength === info.bytes) {
+      this.imageCache.delete(message.id);
+      this.imageCache.set(message.id, cached);
+      return cached;
+    }
+    try {
+      const data = await this.api.image(session, message.id);
+      if (this.session !== session || data.byteLength !== info.bytes) {
+        throw new Error('图片未加载完成。');
+      }
+      this.rememberImage(message.id, data);
+      return data;
+    } catch (error) {
+      this.report(session, error as Error, false);
+      throw error;
+    }
+  }
+
+  private rememberImage(id: number, data: ArrayBuffer): void {
+    this.imageCacheBytes -= this.imageCache.get(id)?.byteLength ?? 0;
+    this.imageCache.delete(id);
+    this.imageCache.set(id, data);
+    this.imageCacheBytes += data.byteLength;
+    while (this.imageCacheBytes > 32 * 1024 * 1024 || this.imageCache.size > 96) {
+      const oldest = this.imageCache.keys().next();
+      if (oldest.done) { break; }
+      this.imageCacheBytes -= this.imageCache.get(oldest.value)?.byteLength ?? 0;
+      this.imageCache.delete(oldest.value);
+    }
+  }
+
   async send(): Promise<void> {
     const session = this.session;
     const peer = this.peer;
     const body = this.draft.trim();
-    if (!session || !peer || !body || this.signingOut || this.ending || this.sendingPeers.includes(peer.id)) {
+    const image = this.imageDraft;
+    if (!session || !peer || (!image && !body) || this.signingOut || this.ending || this.sendingPeers.includes(peer.id)) {
       return;
     }
-    if (Array.from(body).length > 2000) {
+    if (!image && Array.from(body).length > 2000) {
       this.notice = '每条消息最多 2000 个字符。';
       return;
     }
     this.notice = '';
     const request: OutgoingMessage = this.drafts.get(peer.id)?.request ??
       { client_id: util.generateRandomUUID(), body };
-    this.drafts.set(peer.id, { body: this.draft, request });
+    if (!image) {
+      this.drafts.set(peer.id, { body: this.draft, request });
+    }
     this.sendingPeers = [...this.sendingPeers, peer.id];
     try {
-      const sent = await this.api.send(session, peer.id, request);
+      const sent = image ? await this.api.sendImage(session, peer.id, image.id, image.data) :
+        await this.api.send(session, peer.id, request);
       if (this.session === session && !this.signingOut) {
+        if (image && sent.image?.bytes === image.data.byteLength) {
+          this.rememberImage(sent.id, image.data);
+        }
         this.merge(session, peer.id, [sent]);
-        this.drafts.delete(peer.id);
-        if (this.peer?.id === peer.id) {
-          this.draft = '';
+        if (image) {
+          if (this.imageDraft === image) {
+            this.imageDraft = undefined;
+          }
+        } else {
+          this.drafts.delete(peer.id);
+          if (this.peer?.id === peer.id) {
+            this.draft = '';
+          }
         }
       }
     } catch (error) {
@@ -627,6 +699,8 @@ export class ChatStore {
     this.sendingPeers = [];
     this.readThrough.clear();
     this.drafts.clear();
+    this.imageCache.clear();
+    this.imageCacheBytes = 0;
     this.closeChat();
   }
 }

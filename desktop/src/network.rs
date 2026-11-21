@@ -1,12 +1,12 @@
-use std::{net::IpAddr, sync::Mutex, time::Duration};
+use std::{collections::VecDeque, net::IpAddr, sync::Mutex, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use keyring_core::api::CredentialStoreApi;
 use portal_protocol::{
     Activate, Activated, ApiError, Avatar, AvatarChange, ConversationEnd, DEFAULT_SERVER_ADDRESS,
-    Directory, Event, FriendAnswer, IssuedAccount, Link, Member, Message, NicknameChange,
-    SendMessage,
+    Directory, Event, FriendAnswer, IMAGE_MAX_BYTES, IssuedAccount, Link, Member, Message,
+    NicknameChange, SendMessage,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -30,6 +30,42 @@ struct Connection {
     session: Option<Session>,
     task: Option<JoinHandle<()>>,
     link: Link,
+    photos: ImageCache,
+}
+
+const IMAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const IMAGE_CACHE_COUNT: usize = 96;
+
+#[derive(Default)]
+struct ImageCache {
+    entries: VecDeque<(i64, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl ImageCache {
+    fn get(&mut self, id: i64, expected: Option<usize>) -> Option<Vec<u8>> {
+        let index = self.entries.iter().position(|(key, bytes)| {
+            *key == id && expected.is_none_or(|size| size == bytes.len())
+        })?;
+        let entry = self.entries.remove(index)?;
+        let bytes = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(bytes)
+    }
+
+    fn insert(&mut self, id: i64, bytes: Vec<u8>) {
+        if let Some(index) = self.entries.iter().position(|(key, _)| *key == id)
+            && let Some((_, old)) = self.entries.remove(index)
+        {
+            self.bytes -= old.len();
+        }
+        self.bytes += bytes.len();
+        self.entries.push_back((id, bytes));
+        while self.bytes > IMAGE_CACHE_BYTES || self.entries.len() > IMAGE_CACHE_COUNT {
+            let (_, expired) = self.entries.pop_front().expect("cache is over its limit");
+            self.bytes -= expired.len();
+        }
+    }
 }
 
 pub struct Network {
@@ -56,6 +92,14 @@ impl Network {
         self.state.lock().unwrap().link.clone()
     }
 
+    pub(crate) fn sticker_account(&self, revision: u64) -> Result<(String, i64), String> {
+        let (session, current) = self.session()?;
+        if revision != current {
+            return Err("会话已切换".into());
+        }
+        Ok((session.server.to_string(), session.member.id))
+    }
+
     fn session(&self) -> Result<(Session, u64), String> {
         let state = self.state.lock().unwrap();
         let session = state.session.clone().ok_or("请先用安全码连接服务器")?;
@@ -65,6 +109,15 @@ impl Network {
     pub fn current(&self, revision: u64) -> bool {
         let state = self.state.lock().unwrap();
         state.link.revision == revision && state.session.is_some()
+    }
+
+    fn remember_image(&self, revision: u64, id: i64, bytes: Vec<u8>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.link.revision != revision || state.session.is_none() {
+            return false;
+        }
+        state.photos.insert(id, bytes);
+        true
     }
 
     fn announce(&self, app: &AppHandle) {
@@ -110,6 +163,7 @@ impl Network {
             notice,
         };
         state.session = Some(session.clone());
+        state.photos = ImageCache::default();
         state.task = Some(tauri::async_runtime::spawn(connect_loop(
             app.clone(),
             session,
@@ -128,6 +182,7 @@ impl Network {
                 task.abort();
             }
             state.session = None;
+            state.photos = ImageCache::default();
             state.link = Link {
                 revision: state.link.revision + 1,
                 notice,
@@ -496,6 +551,140 @@ pub async fn send_message(
         .send()
         .await;
     decode(network.check(&app, revision, result).await?).await
+}
+
+#[tauri::command]
+pub async fn send_image(
+    app: AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Message, String> {
+    let header = |name| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    let peer = header("x-portal-peer")
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or("无效的会话")?;
+    let client_id = header("x-portal-client-id")
+        .filter(|value| {
+            value.len() == 36
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        })
+        .ok_or("无效的消息编号")?;
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("无法读取图片".into());
+    };
+    if bytes.is_empty() || bytes.len() > IMAGE_MAX_BYTES {
+        return Err("图片不能超过 8 MiB".into());
+    }
+    let network = app.state::<Network>();
+    let (session, revision) = network.session()?;
+    let result = network
+        .client
+        .post(endpoint(
+            &session.server,
+            &format!("message-images/{peer}/{client_id}"),
+        ))
+        .timeout(Duration::from_secs(60))
+        .bearer_auth(session.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(bytes.clone())
+        .send()
+        .await;
+    let message: Message = decode(network.check(&app, revision, result).await?).await?;
+    if message
+        .image
+        .as_ref()
+        .is_some_and(|info| info.bytes as usize == bytes.len())
+        && !network.remember_image(revision, message.id, bytes.clone())
+    {
+        return Err("会话已切换".into());
+    }
+    Ok(message)
+}
+
+#[tauri::command]
+pub async fn fetch_image(
+    app: AppHandle,
+    id: i64,
+    expected_bytes: Option<u32>,
+) -> Result<tauri::ipc::Response, String> {
+    let expected = expected_bytes.map(|bytes| bytes as usize);
+    if expected.is_some_and(|length| length == 0 || length > IMAGE_MAX_BYTES) {
+        return Err("图片大小无效".into());
+    }
+    let network = app.state::<Network>();
+    let (session, revision) = network.session()?;
+    {
+        let mut state = network.state.lock().unwrap();
+        if state.link.revision != revision {
+            return Err("会话已切换".into());
+        }
+        if let Some(bytes) = state.photos.get(id, expected) {
+            return Ok(tauri::ipc::Response::new(bytes));
+        }
+    }
+    let result = network
+        .client
+        .get(endpoint(&session.server, &format!("message-images/{id}")))
+        .timeout(Duration::from_secs(45))
+        .bearer_auth(session.token)
+        .send()
+        .await;
+    let mut response = network.check(&app, revision, result).await?;
+    let declared = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok());
+    if declared.is_some_and(|length| length > IMAGE_MAX_BYTES) {
+        return Err("图片不能超过 8 MiB".into());
+    }
+    if expected
+        .zip(declared)
+        .is_some_and(|(expected, declared)| expected != declared)
+    {
+        return Err("图片数据不完整".into());
+    }
+    let expected = expected.or(declared);
+    let mut bytes = Vec::with_capacity(expected.unwrap_or_default());
+    while let Some(chunk) = response.chunk().await.map_err(|_| "下载图片失败")? {
+        if chunk.len() > IMAGE_MAX_BYTES - bytes.len() {
+            return Err("图片不能超过 8 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() || expected.is_some_and(|length| length != bytes.len()) {
+        return Err("图片数据不完整".into());
+    }
+    if !network.remember_image(revision, id, bytes.clone()) {
+        return Err("会话已切换".into());
+    }
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[cfg(test)]
+mod image_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_checks_size_and_drops_least_recently_used_images() {
+        let mut cache = ImageCache::default();
+        for id in 0..4 {
+            cache.insert(id, vec![id as u8; IMAGE_MAX_BYTES]);
+        }
+        assert!(cache.get(0, Some(16)).is_none());
+        assert_eq!(cache.get(0, Some(IMAGE_MAX_BYTES)).unwrap()[0], 0);
+        cache.insert(4, vec![4; IMAGE_MAX_BYTES]);
+        assert_eq!(cache.bytes, IMAGE_CACHE_BYTES);
+        assert!(cache.get(1, None).is_none());
+        assert_eq!(cache.get(0, None).unwrap().len(), IMAGE_MAX_BYTES);
+        cache.insert(0, vec![9]);
+        assert_eq!(cache.get(0, Some(1)), Some(vec![9]));
+        assert_eq!(cache.bytes, 3 * IMAGE_MAX_BYTES + 1);
+    }
 }
 
 #[tauri::command]

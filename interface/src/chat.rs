@@ -4,9 +4,15 @@ use portal_protocol::{
     NicknameChange, Person, Relationship, SECURITY_CODE_LENGTH, SendMessage,
 };
 use serde::Serialize;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use super::{Sprite, command, friend_palette, listen_payload, request};
+#[path = "emoji.rs"]
+mod emoji;
+#[path = "photos.rs"]
+mod photos;
+use photos::{DraftThumbnail, IMAGE_ACCEPT, ImageDraft, MAX_ATTACHMENTS, MessageImage};
 
 #[derive(Serialize)]
 struct Activation {
@@ -48,6 +54,10 @@ struct Model {
     history: RwSignal<Vec<Message>>,
     directory_request: RwSignal<u64>,
     draft: RwSignal<String>,
+    attachments: RwSignal<Vec<ImageDraft>, LocalStorage>,
+    attachment_failed: RwSignal<bool>,
+    original_images: RwSignal<bool>,
+    stickers_changed: RwSignal<u64>,
     retry: RwSignal<Option<(i64, String, String)>>,
     error: RwSignal<String>,
     ending: RwSignal<bool>,
@@ -65,6 +75,10 @@ impl Model {
             history: RwSignal::new(Vec::new()),
             directory_request: RwSignal::new(0),
             draft: RwSignal::new(String::new()),
+            attachments: RwSignal::new_local(Vec::new()),
+            attachment_failed: RwSignal::new(false),
+            original_images: RwSignal::new(false),
+            stickers_changed: RwSignal::new(0),
             retry: RwSignal::new(None),
             error: RwSignal::new(String::new()),
             ending: RwSignal::new(false),
@@ -85,6 +99,7 @@ impl Model {
             self.history.set(Vec::new());
             self.retry.set(None);
             self.draft.set(String::new());
+            self.clear_attachments();
             self.error.set(String::new());
             self.ending.set(false);
             self.members.set(true);
@@ -170,6 +185,7 @@ impl Model {
         if self.peer() != Some(member.id) {
             self.history.set(Vec::new());
             self.draft.set(String::new());
+            self.clear_attachments();
             self.retry.set(None);
         }
         let peer = member.id;
@@ -239,6 +255,7 @@ impl Model {
         self.selected.set(None);
         self.history.set(Vec::new());
         self.draft.set(String::new());
+        self.clear_attachments();
         self.retry.set(None);
         spawn_local(async {
             let _ = request::<_, ()>("choose_conversation", Selection { peer: None }).await;
@@ -287,47 +304,128 @@ impl Model {
         });
     }
 
-    fn send(self, form: SubmitEvent) {
+    fn clear_attachments(self) {
+        self.attachments.set(Vec::new());
+        self.attachment_failed.set(false);
+        self.original_images.set(false);
+    }
+
+    fn busy(self) -> bool {
+        self.sending.get() || self.ending.get()
+    }
+
+    fn add_attachments(self, files: web_sys::FileList) {
+        let mut first_error = None;
+        for index in 0..files.length().min(MAX_ATTACHMENTS as u32) {
+            if self.attachments.with_untracked(Vec::len) >= MAX_ATTACHMENTS {
+                first_error.get_or_insert("每次最多发送 9 张图片");
+                break;
+            }
+            if let Some(file) = files.get(index) {
+                if let Err(error) = self.add_attachment(file) {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if files.length() > MAX_ATTACHMENTS as u32 {
+            first_error.get_or_insert("每次最多发送 9 张图片");
+        }
+        self.error.set(first_error.unwrap_or_default().into());
+    }
+
+    fn add_attachment(self, file: web_sys::File) -> Result<(), &'static str> {
+        if self.sending.get_untracked() || self.ending.get_untracked() || self.peer().is_none() {
+            return Err("请等当前操作完成");
+        }
+        if self.attachments.with_untracked(Vec::len) >= MAX_ATTACHMENTS {
+            return Err("每次最多发送 9 张图片");
+        }
+        let attachment = ImageDraft::new(file)?;
+        self.attachments
+            .update(|attachments| attachments.push(attachment));
+        Ok(())
+    }
+
+    fn send(self, form: SubmitEvent, on_sent: impl FnOnce() + 'static) {
         form.prevent_default();
         let body = self.draft.get_untracked().trim().to_owned();
-        if self.sending.get_untracked() || self.ending.get_untracked() || body.is_empty() {
+        let attachments = self.attachments.get_untracked();
+        let original = self.original_images.get_untracked();
+        if self.sending.get_untracked()
+            || self.ending.get_untracked()
+            || (attachments.is_empty() && (body.is_empty() || body.chars().count() > 2000))
+        {
             return;
         }
         let Some(peer) = self.peer() else { return };
-        let id = self
-            .retry
-            .get_untracked()
-            .filter(|(old_peer, old_body, _)| *old_peer == peer && old_body == &body)
-            .map_or_else(|| uuid::Uuid::new_v4().to_string(), |(_, _, id)| id);
-        self.retry.set(Some((peer, body.clone(), id.clone())));
         self.sending.set(true);
         self.error.set(String::new());
         let revision = self.revision();
         spawn_local(async move {
-            let response = request::<_, Message>(
-                "send_message",
-                Outgoing {
-                    peer,
-                    message: SendMessage {
-                        client_id: id,
-                        body: body.clone(),
+            if attachments.is_empty() {
+                let id = self
+                    .retry
+                    .get_untracked()
+                    .filter(|(old_peer, old_body, _)| *old_peer == peer && old_body == &body)
+                    .map_or_else(|| uuid::Uuid::new_v4().to_string(), |(_, _, id)| id);
+                self.retry.set(Some((peer, body.clone(), id.clone())));
+                let response = request::<_, Message>(
+                    "send_message",
+                    Outgoing {
+                        peer,
+                        message: SendMessage {
+                            client_id: id,
+                            body: body.clone(),
+                        },
                     },
-                },
-            )
-            .await;
-            self.sending.set(false);
-            if self.revision() != revision || self.peer() != Some(peer) {
+                )
+                .await;
+                self.sending.set(false);
+                if self.revision() != revision || self.peer() != Some(peer) {
+                    return;
+                }
+                match response {
+                    Ok(message) => {
+                        self.merge([message]);
+                        self.retry.set(None);
+                        if self.draft.with_untracked(|draft| draft.trim() == body) {
+                            self.draft.set(String::new());
+                        }
+                        on_sent();
+                    }
+                    Err(error) => self.error.set(error),
+                }
                 return;
             }
-            match response {
-                Ok(message) => {
-                    self.merge([message]);
-                    self.retry.set(None);
-                    if self.draft.with_untracked(|draft| draft.trim() == body) {
-                        self.draft.set(String::new());
+
+            let mut sent = false;
+            for image in attachments {
+                let response = photos::send(peer, &image, original).await;
+                if self.revision() != revision || self.peer() != Some(peer) {
+                    self.sending.set(false);
+                    return;
+                }
+                match response {
+                    Ok(message) => {
+                        self.merge([message]);
+                        self.attachments.update(|pending| {
+                            pending.retain(|draft| draft.client_id != image.client_id)
+                        });
+                        sent = true;
+                    }
+                    Err(error) => {
+                        self.error.set(error);
+                        self.attachment_failed.set(true);
+                        break;
                     }
                 }
-                Err(error) => self.error.set(error),
+            }
+            self.sending.set(false);
+            if self.attachments.with_untracked(Vec::is_empty) {
+                self.clear_attachments();
+            }
+            if sent {
+                on_sent();
             }
         });
     }
@@ -685,8 +783,123 @@ fn DirectoryRow(model: Model, person: Person) -> impl IntoView {
 
 #[component]
 fn Conversation(model: Model, input: NodeRef<html::Input>) -> impl IntoView {
+    let history = NodeRef::<html::Div>::new();
+    let picker = NodeRef::<html::Input>::new();
+    let choose_image = move |_| {
+        if let Some(picker) = picker.get_untracked() {
+            if let Some(files) = picker.files() {
+                model.add_attachments(files);
+            }
+            picker.set_value("");
+        }
+    };
+    let drag_depth = RwSignal::new(0u32);
+    let dragging_files = |data: &web_sys::DataTransfer| {
+        data.types()
+            .iter()
+            .any(|value| value.as_string().as_deref() == Some("Files"))
+    };
+    let emoji_open = RwSignal::new(false);
+    Effect::watch(
+        move || model.selected.with(|peer| peer.as_ref().map(|m| m.id)),
+        move |_, _, _| {
+            emoji_open.set(false);
+            drag_depth.set(0);
+        },
+        false,
+    );
+    let at_bottom = RwSignal::new(true);
+    let has_new_messages = RwSignal::new(false);
+    let scroll_to_latest = move || {
+        request_animation_frame(move || {
+            if let Some(list) = history.try_get_untracked().flatten() {
+                list.set_scroll_top(list.scroll_height());
+                at_bottom.set(true);
+                has_new_messages.set(false);
+            }
+        });
+    };
+    Effect::watch(
+        move || {
+            let peer = model
+                .selected
+                .with(|peer| peer.as_ref().map(|member| member.id));
+            let last = model.history.with(|history| {
+                history
+                    .last()
+                    .map(|message| (message.id, message.sender.id))
+            });
+            (peer, last)
+        },
+        move |current, previous, _| {
+            if previous == Some(current) {
+                return;
+            }
+            let (peer, last) = current;
+            let Some((_, sender)) = last else {
+                at_bottom.set(true);
+                has_new_messages.set(false);
+                return;
+            };
+            let opening =
+                previous.is_none_or(|(old_peer, old_last)| old_peer != peer || old_last.is_none());
+            if opening || at_bottom.get_untracked() {
+                scroll_to_latest();
+            } else if Some(*sender) == *peer {
+                has_new_messages.set(true);
+            }
+        },
+        true,
+    );
+
     view! {
-        <section class="conversation">
+        <section class="conversation"
+            on:dragenter=move |event: ev::DragEvent| {
+                if event.data_transfer().as_ref().is_some_and(dragging_files) {
+                    event.prevent_default();
+                    emoji_open.set(false);
+                    drag_depth.update(|depth| *depth = depth.saturating_add(1));
+                }
+            }
+            on:dragover=move |event: ev::DragEvent| {
+                if let Some(data) = event.data_transfer().filter(dragging_files) {
+                    event.prevent_default();
+                    data.set_drop_effect(if model.sending.get_untracked() || model.ending.get_untracked() { "none" } else { "copy" });
+                }
+            }
+            on:dragleave=move |_| drag_depth.update(|depth| *depth = depth.saturating_sub(1))
+            on:drop=move |event: ev::DragEvent| {
+                drag_depth.set(0);
+                if let Some(data) = event.data_transfer().filter(dragging_files) {
+                    event.prevent_default();
+                    emoji_open.set(false);
+                    if let Some(files) = data.files() {
+                        model.add_attachments(files);
+                    }
+                }
+            }
+            on:paste=move |event: ev::ClipboardEvent| {
+                if let Some(files) = event.clipboard_data().and_then(|data| data.files()).filter(|files| files.length() > 0) {
+                    event.prevent_default();
+                    emoji_open.set(false);
+                    model.add_attachments(files);
+                }
+            }
+            on:keydown=move |event: ev::KeyboardEvent| {
+                if event.key() == "Escape" && emoji_open.get_untracked() {
+                    event.prevent_default();
+                    emoji_open.set(false);
+                    if let Some(input) = input.get_untracked() { let _ = input.focus(); }
+                }
+            }
+            on:click=move |event: ev::MouseEvent| {
+                if emoji_open.get_untracked() && event.target()
+                    .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                    .is_some_and(|target| target.closest(".emoji-panel, .emoji-toggle").ok().flatten().is_none())
+                {
+                    emoji_open.set(false);
+                }
+            }>
             <div class="conversation-heading">
                 <button class="plain" on:click=move |_| model.leave()>"返回成员"</button>
                 <strong>{move || model.selected.with(|peer| peer.as_ref().map(|m| m.nickname.clone()).unwrap_or_default())}</strong>
@@ -695,19 +908,106 @@ fn Conversation(model: Model, input: NodeRef<html::Input>) -> impl IntoView {
                     {move || if model.ending.get() { "正在结束…" } else { "结束聊天" }}
                 </button>
             </div>
-            <div class="chat-history" role="log" aria-label="聊天记录">
-                <For each=move || model.history.get() key=|message| message.id
-                    children=move |message| {
-                        let mine = model.link.with_untracked(|link| link.member.as_ref().is_some_and(|me| me.id == message.sender.id));
-                        view! { <div class="chat-row" class:mine=mine><p>{message.body}</p></div> }
-                    }/>
+            <div class="history-pane">
+                <div class="chat-history" node_ref=history role="log" aria-label="聊天记录"
+                    on:scroll=move |_| {
+                        if let Some(list) = history.get_untracked() {
+                            let near_bottom = list.scroll_height() - list.client_height() - list.scroll_top() <= 8;
+                            at_bottom.set(near_bottom);
+                            if near_bottom {
+                                has_new_messages.set(false);
+                            }
+                        }
+                    }>
+                    <For each=move || model.history.get() key=|message| message.id
+                        children=move |message| {
+                            let mine = model.link.with_untracked(|link| link.member.as_ref().is_some_and(|me| me.id == message.sender.id));
+                            view! { <div class="chat-row" class:mine=mine>
+                                {if let Some(info) = message.image {
+                                    view! { <MessageImage model=model id=message.id info=info history=history/> }.into_any()
+                                } else {
+                                    view! { <p>{message.body}</p> }.into_any()
+                                }}
+                            </div> }
+                        }/>
+                </div>
+                <Show when=move || has_new_messages.get()>
+                    <button type="button" class="jump-to-latest" aria-label="有新消息，回到底部"
+                        on:click=move |_| scroll_to_latest()>"↓ 新消息"</button>
+                </Show>
+                <Show when=move || { drag_depth.get() > 0 && !model.busy() }>
+                    <div class="drop-preview" aria-hidden="true"><strong>"松开添加图片"</strong><span>"预览确认后发送"</span></div>
+                </Show>
             </div>
-            <form class="compose" on:submit=move |event| model.send(event)>
-                <input node_ref=input aria-label="回复消息" placeholder="输入消息…"
-                    maxlength=2000 prop:value=move || model.draft.get()
-                    on:input=move |event| model.draft.set(event_target_value(&event))/>
-                <button type="submit" disabled=move || model.sending.get() || model.ending.get()
-                    || model.draft.with(|text| text.trim().is_empty())>"发送"</button>
+            <form class="compose" on:submit=move |event| {
+                emoji_open.set(false);
+                model.send(event, scroll_to_latest);
+            }>
+                <Show when=move || emoji_open.get()>
+                    <emoji::EmojiPanel model=model input=input open=emoji_open/>
+                </Show>
+                <Show when=move || model.attachments.with(|items| !items.is_empty())>
+                    <div class="attachment-strip" aria-label="待发送图片">
+                        <For each=move || model.attachments.get() key=|entry| entry.client_id.clone()
+                            children=move |entry| {
+                                let name = entry.file.name();
+                                view! {
+                                    <div class="attachment" title=name.clone()>
+                                        <DraftThumbnail file=entry.file/>
+                                        <button type="button" aria-label=format!("移除 {name}")
+                                            disabled=move || model.sending.get()
+                                            on:click=move |_| {
+                                                model.attachments.update(|pending| pending.retain(|photo| photo.client_id != entry.client_id));
+                                                if model.attachments.with_untracked(Vec::is_empty) {
+                                                    model.original_images.set(false);
+                                                }
+                                                if model.attachment_failed.get_untracked() {
+                                                    model.attachment_failed.set(false);
+                                                    model.error.set(String::new());
+                                                }
+                                            }>"×"</button>
+                                    </div>
+                                }
+                            }/>
+                    </div>
+                    <Show when=move || model.attachments.with(|items| items.iter().any(ImageDraft::can_reduce))>
+                        <label class="original-images" title="保留大照片的原始尺寸和文件">
+                            <input type="checkbox"
+                                prop:checked=move || model.original_images.get()
+                                disabled=move || model.busy() || model.attachment_failed.get()
+                                on:change=move |event| model.original_images.set(event_target_checked(&event))/>
+                            "原图"
+                        </label>
+                    </Show>
+                </Show>
+                <div class="compose-line">
+                    <input type="file" accept=IMAGE_ACCEPT multiple=true
+                        node_ref=picker on:change=choose_image hidden=true/>
+                    <button type="button" class="compose-tool emoji-toggle" aria-label="表情" title="表情与收藏"
+                        aria-expanded=move || emoji_open.get().to_string()
+                        aria-controls="emoji-panel"
+                        disabled=move || model.busy()
+                        on:click=move |_| emoji_open.update(|open| *open = !*open)>"☺"</button>
+                    <button type="button" class="compose-tool" aria-label="添加图片" title="选择、拖拽或粘贴图片"
+                        disabled=move || model.busy()
+                        on:click=move |_| if let Some(picker) = picker.get_untracked() {
+                            emoji_open.set(false);
+                            picker.click();
+                        }>"图片"</button>
+                    <input node_ref=input aria-label="回复消息" placeholder="输入消息…"
+                        maxlength=4000
+                        prop:value=move || model.draft.get()
+                        on:input=move |event| model.draft.set(event_target_value(&event))/>
+                    <button type="submit" disabled=move || model.busy()
+                        || (model.attachments.with(Vec::is_empty) && model.draft.with(|text| {
+                            text.trim().is_empty() || text.trim().chars().count() > 2000
+                        }))>
+                        {move || if model.sending.get() { "发送中…" } else if model.attachment_failed.get() { "重试发送" } else { "发送" }}
+                    </button>
+                </div>
+                <Show when=move || { model.attachments.with(Vec::is_empty) && model.draft.with(|text| text.trim().chars().count() > 2000) }>
+                    <small class="compose-warning" role="status">"消息最多 2000 个字符"</small>
+                </Show>
             </form>
         </section>
     }

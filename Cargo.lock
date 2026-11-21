@@ -2137,6 +2137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3468,8 +3474,10 @@ dependencies = [
  "js-sys",
  "leptos",
  "portal-protocol",
+ "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3478,19 +3486,22 @@ dependencies = [
 
 [[package]]
 name = "portal-pet"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "apple-native-keyring-store",
  "futures-util",
+ "imagesize",
  "keyring-core",
  "objc2-app-kit",
  "portal-protocol",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "url",
@@ -3511,10 +3522,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "hmac",
+ "imagesize",
  "portal-protocol",
+ "reqwest",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "time",
  "tokio",
  "uuid",
 ]

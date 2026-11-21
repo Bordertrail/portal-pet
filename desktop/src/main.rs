@@ -5,10 +5,11 @@
 
 mod network;
 mod passive;
+mod stickers;
 mod visits;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -39,7 +40,7 @@ type DesktopResult = Result<(), String>;
 struct DesktopState {
     ready: HashSet<String>,
     hidden: bool,
-    unread: HashSet<i64>,
+    unread: HashMap<i64, u32>,
     selected: Option<i64>,
     visits: visits::Visits,
 }
@@ -173,8 +174,8 @@ async fn choose_conversation(app: AppHandle, peer: Option<i64>) -> DesktopResult
 }
 
 #[tauri::command]
-async fn open_arrival(app: AppHandle, generation: u64) -> DesktopResult {
-    run_desktop(&app, move |app| visits::open_bubble(app, generation))
+async fn open_arrival(app: AppHandle, peer: i64) -> DesktopResult {
+    run_desktop(&app, move |app| visits::open_bubble(app, peer))
 }
 
 #[tauri::command]
@@ -342,6 +343,18 @@ fn create_webview(
     if let Some(member) = visitor {
         script.push_str(&format!("globalThis.portalVisitor = {member};"));
     }
+    if chat {
+        script.push_str(
+            "for (const name of ['dragover', 'drop']) {
+                addEventListener(name, event => {
+                    if (!event.defaultPrevented && event.dataTransfer) {
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = 'none';
+                    }
+                });
+            }",
+        );
+    }
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .initialization_script(script)
         .on_page_load(|window, payload| {
@@ -358,6 +371,7 @@ fn create_webview(
     if chat {
         builder = builder
             .title("桌宠聊天")
+            .disable_drag_drop_handler()
             .min_inner_size(530.0, 440.0)
             .center();
     } else {
@@ -436,6 +450,7 @@ fn main() {
     builder
         .manage(Desktop::new(duration()))
         .manage(network::Network::new())
+        .manage(stickers::Shelf::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -479,13 +494,25 @@ fn main() {
             }
         })
         .on_window_event(|window, event| {
-            if window.label() == CHAT
-                && let WindowEvent::CloseRequested { api, .. } = event
-            {
-                api.prevent_close();
-                if let Err(error) = window.hide() {
-                    eprintln!("{error}");
+            if window.label() != CHAT {
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        eprintln!("{error}");
+                    }
                 }
+                WindowEvent::Focused(true) => {
+                    let selected = window.state::<Desktop>().state.lock().unwrap().selected;
+                    if selected.is_some()
+                        && let Err(error) = select_chat(window.app_handle(), selected)
+                    {
+                        eprintln!("{error}");
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -507,6 +534,12 @@ fn main() {
             network::answer_friend,
             network::fetch_messages,
             network::send_message,
+            network::send_image,
+            network::fetch_image,
+            stickers::list_stickers,
+            stickers::save_sticker,
+            stickers::load_sticker,
+            stickers::remove_sticker,
             network::end_conversation,
             webview_warning
         ])

@@ -5,10 +5,17 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       PORTAL_TRUST_PROXY: "1"
+      PORTAL_OSS_BUCKET: "${PORTAL_OSS_BUCKET:-}"
+      PORTAL_OSS_REGION: "${PORTAL_OSS_REGION:-}"
+      PORTAL_OSS_INTERNAL: "${PORTAL_OSS_INTERNAL:-0}"
+      OSS_ACCESS_KEY_ID: "${OSS_ACCESS_KEY_ID:-}"
+      OSS_ACCESS_KEY_SECRET: "${OSS_ACCESS_KEY_SECRET:-}"
+      OSS_SECURITY_TOKEN: "${OSS_SECURITY_TOKEN:-}"
     volumes:
       - portal_data:/data
     networks:
       - backend
+      - oss_egress
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8765/health"]
@@ -39,6 +46,7 @@ services:
 
 networks:
   edge:
+  oss_egress:
   backend:
     internal: true
 
